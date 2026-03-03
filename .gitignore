@@ -1,0 +1,15 @@
+# WHMCS template cache
+templates_c/
+
+# IDE files
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Encoded files (if ionCube used later)
+*.encoded.php
