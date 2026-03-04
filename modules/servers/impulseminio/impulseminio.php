@@ -616,7 +616,9 @@ function impulseminio_renderClientArea(array $params = []): string
     // Flash message — stored for injection into Access Keys tab
     $o = '';
     $newKeyFlash = '';
+    $hasNewKeyFlash = false;
     if (!empty($_SESSION['impulseminio_new_key'])) {
+        $hasNewKeyFlash = true;
         $nk = $_SESSION['impulseminio_new_key'];
         $eak = $esc($nk['accessKey'] ?? '');
         $esk = $esc($nk['secretKey'] ?? '');
@@ -629,7 +631,11 @@ function impulseminio_renderClientArea(array $params = []): string
         $newKeyFlash .= '<div class="col-md-6"><label>Access Key</label><div class="input-group"><input type="text" class="form-control" id="newAccessKey" value="' . $eak . '" readonly><span class="input-group-btn"><button class="btn btn-default" onclick="idCopy(\'newAccessKey\')"><i class="fas fa-copy"></i></button></span></div></div>';
         $newKeyFlash .= '<div class="col-md-6"><label>Secret Key</label><div class="input-group"><input type="text" class="form-control" id="newSecretKey" value="' . $esk . '" readonly><span class="input-group-btn"><button class="btn btn-default" onclick="idCopy(\'newSecretKey\')"><i class="fas fa-copy"></i></button></span></div></div>';
         $newKeyFlash .= '</div>';
-        $newKeyFlash .= '<div style="margin-top:12px;"><button class="btn btn-primary btn-sm" onclick="downloadCredentials(\'' . $eak . '\',\'' . $esk . '\',\'' . $ekLabel . '\')"><i class="fas fa-download"></i> Download Credentials (.txt)</button></div>';
+        // Hidden fields for downloadCredentials — avoids inline JS escaping issues with special chars
+        $newKeyFlash .= '<input type="hidden" id="dlCredAk" value="' . $eak . '">';
+        $newKeyFlash .= '<input type="hidden" id="dlCredSk" value="' . $esk . '">';
+        $newKeyFlash .= '<input type="hidden" id="dlCredLabel" value="' . $ekLabel . '">';
+        $newKeyFlash .= '<div style="margin-top:12px;"><button class="btn btn-primary btn-sm" onclick="downloadCredentials()"><i class="fas fa-download"></i> Download Credentials (.txt)</button></div>';
         $newKeyFlash .= '</div>';
         unset($_SESSION['impulseminio_new_key']);
     }
@@ -856,8 +862,66 @@ function impulseminio_renderClientArea(array $params = []): string
     $o .= 'function resetPassword(){if(!confirm("Reset your secret key? Your current key will stop working immediately. You will need to update all applications using the current key.")){return;}var f=document.createElement("form");f.method="post";f.action="clientarea.php?action=productdetails&id=' . $serviceId . '#overview";f.innerHTML=\'<input type="hidden" name="token" value="\'+ csrfToken+\'"><input type="hidden" name="modop" value="custom"><input type="hidden" name="a" value="clientResetPassword"><input type="hidden" name="id" value="' . $serviceId . '">\';document.body.appendChild(f);f.submit();}';
     // Copy All credentials to clipboard
     $o .= 'function copyAllCreds(){var t="S3 Endpoint: "+document.getElementById("s3endpoint").value+"\\nRegion: us-east-1\\nAccess Key: "+document.getElementById("accesskey").value+"\\nSecret Key: "+document.getElementById("secretkey").value+"\\nDefault Bucket: "+document.getElementById("bucketname").value;navigator.clipboard?navigator.clipboard.writeText(t).then(function(){alert("Connection details copied to clipboard.")}):alert("Could not copy — use individual copy buttons instead.");}';
-    // Download credentials as .txt file with full connection info
-    $o .= 'function downloadCredentials(ak,sk,label){var lines=[];lines.push("================================================");lines.push("  ImpulseDrive — S3 Access Key Credentials");lines.push("================================================");lines.push("");lines.push("Created:      "+new Date().toISOString());if(label)lines.push("Label:        "+label);lines.push("");lines.push("--- Connection Details ---");lines.push("S3 Endpoint:  "+document.getElementById("s3endpoint").value);lines.push("Region:       us-east-1");lines.push("Access Key:   "+ak);lines.push("Secret Key:   "+sk);lines.push("");lines.push("--- Default Bucket ---");lines.push("Bucket:       "+document.getElementById("bucketname").value);lines.push("");lines.push("--- AWS CLI Quick Start ---");lines.push("aws configure set aws_access_key_id "+ak);lines.push("aws configure set aws_secret_access_key "+sk);lines.push("aws --endpoint-url "+document.getElementById("s3endpoint").value+" s3 ls");lines.push("");lines.push("--- rclone Config ---");lines.push("[impulsedrive]");lines.push("type = s3");lines.push("provider = Minio");lines.push("access_key_id = "+ak);lines.push("secret_access_key = "+sk);lines.push("endpoint = "+document.getElementById("s3endpoint").value);lines.push("acl = private");lines.push("");lines.push("--- boto3 (Python) ---");lines.push("import boto3");lines.push("s3 = boto3.client(\\\"s3\\\",");lines.push("    endpoint_url=\\\""+document.getElementById("s3endpoint").value+"\\\",");lines.push("    aws_access_key_id=\\\""+ak+"\\\",");lines.push("    aws_secret_access_key=\\\""+sk+"\\\",");lines.push("    region_name=\\\"us-east-1\\\"");lines.push(")");lines.push("");lines.push("================================================");lines.push("  KEEP THIS FILE SECURE — DO NOT SHARE");lines.push("  The secret key cannot be recovered if lost.");lines.push("================================================");var blob=new Blob([lines.join("\\n")],{type:"text/plain"});var url=URL.createObjectURL(blob);var a=document.createElement("a");a.href=url;a.download="impulsedrive-credentials-"+ak.substring(0,8)+".txt";document.body.appendChild(a);a.click();document.body.removeChild(a);URL.revokeObjectURL(url);}';
+    // Download credentials as .txt file with full connection info — reads from hidden fields
+    $o .= <<<'DLCRED'
+function downloadCredentials(){
+var ak=document.getElementById("dlCredAk").value;
+var sk=document.getElementById("dlCredSk").value;
+var label=document.getElementById("dlCredLabel").value;
+var ep=document.getElementById("s3endpoint").value;
+var bkt=document.getElementById("bucketname").value;
+var L=[];
+L.push("================================================");
+L.push("  ImpulseDrive - S3 Access Key Credentials");
+L.push("================================================");
+L.push("");
+L.push("Created:      "+new Date().toISOString());
+if(label)L.push("Label:        "+label);
+L.push("");
+L.push("--- Connection Details ---");
+L.push("S3 Endpoint:  "+ep);
+L.push("Region:       us-east-1");
+L.push("Access Key:   "+ak);
+L.push("Secret Key:   "+sk);
+L.push("");
+L.push("--- Default Bucket ---");
+L.push("Bucket:       "+bkt);
+L.push("");
+L.push("--- AWS CLI Quick Start ---");
+L.push("aws configure set aws_access_key_id "+ak);
+L.push("aws configure set aws_secret_access_key "+sk);
+L.push("aws --endpoint-url "+ep+" s3 ls");
+L.push("");
+L.push("--- rclone Config ---");
+L.push("[impulsedrive]");
+L.push("type = s3");
+L.push("provider = Minio");
+L.push("access_key_id = "+ak);
+L.push("secret_access_key = "+sk);
+L.push("endpoint = "+ep);
+L.push("acl = private");
+L.push("");
+L.push("--- boto3 (Python) ---");
+L.push("import boto3");
+L.push("s3 = boto3.client(\"s3\",");
+L.push("    endpoint_url=\""+ep+"\",");
+L.push("    aws_access_key_id=\""+ak+"\",");
+L.push("    aws_secret_access_key=\""+sk+"\",");
+L.push("    region_name=\"us-east-1\"");
+L.push(")");
+L.push("");
+L.push("================================================");
+L.push("  KEEP THIS FILE SECURE - DO NOT SHARE");
+L.push("  The secret key cannot be recovered if lost.");
+L.push("================================================");
+var blob=new Blob([L.join("\n")],{type:"text/plain"});
+var url=URL.createObjectURL(blob);
+var a=document.createElement("a");
+a.href=url;a.download="impulsedrive-credentials-"+ak.substring(0,8)+".txt";
+document.body.appendChild(a);a.click();
+document.body.removeChild(a);URL.revokeObjectURL(url);
+}
+DLCRED;
     // File Browser JS
     $o .= 'var fbServiceId=' . $serviceId . ',fbCurrentBucket="' . $defaultBucket . '",fbCurrentPrefix="",fbCsrf=csrfToken;';
     $o .= 'function fbAjax(action,data,cb){data.modop="custom";data.a=action;data.id=fbServiceId;data.token=fbCsrf;var x=new XMLHttpRequest();x.open("POST","clientarea.php?action=productdetails&id="+fbServiceId,true);x.setRequestHeader("Content-Type","application/x-www-form-urlencoded");x.setRequestHeader("X-Requested-With","XMLHttpRequest");x.onload=function(){try{cb(JSON.parse(x.responseText));}catch(e){cb({success:false,error:"Invalid response"});}};x.onerror=function(){cb({success:false,error:"Network error"});};var q=[];for(var k in data)q.push(encodeURIComponent(k)+"="+encodeURIComponent(data[k]));x.send(q.join("&"));}';
@@ -889,7 +953,12 @@ function impulseminio_renderClientArea(array $params = []): string
     // Auto-load files when switching to file browser tab
     $o .= 'document.querySelectorAll(".nav-tabs a[href=\'#tab-files\']").forEach(function(a){a.addEventListener("click",function(){setTimeout(function(){if(document.getElementById("fb-body").children.length<=1)fbRefresh();},100);});});';
     // Fix 8: Activate correct tab from URL hash on page load
-    $o .= '(function(){var h=window.location.hash;if(h){var map={"#buckets":"#tab-buckets","#accesskeys":"#tab-keys","#quickstart":"#tab-quickstart","#overview":"#tab-overview","#files":"#tab-files"};var target=map[h]||h;var tabLink=document.querySelector(\'.nav-tabs a[href="\'+target+\'"]\');if(tabLink){var evt=document.createEvent("HTMLEvents");evt.initEvent("click",true,true);tabLink.dispatchEvent(evt);if(typeof jQuery!=="undefined"){jQuery(tabLink).tab("show");}else{document.querySelectorAll(".nav-tabs li").forEach(function(li){li.classList.remove("active");});tabLink.parentElement.classList.add("active");document.querySelectorAll(".tab-pane").forEach(function(p){p.classList.remove("active");});var pane=document.querySelector(target);if(pane)pane.classList.add("active");}}}';
+    $o .= '(function(){var h=window.location.hash;';
+    // Force Keys tab when new key flash is present (WHMCS strips hash on redirect)
+    if ($hasNewKeyFlash) {
+        $o .= 'h="#accesskeys";';
+    }
+    $o .= 'if(h){var map={"#buckets":"#tab-buckets","#accesskeys":"#tab-keys","#quickstart":"#tab-quickstart","#overview":"#tab-overview","#files":"#tab-files"};var target=map[h]||h;var tabLink=document.querySelector(\'.nav-tabs a[href="\'+target+\'"]\');if(tabLink){var evt=document.createEvent("HTMLEvents");evt.initEvent("click",true,true);tabLink.dispatchEvent(evt);if(typeof jQuery!=="undefined"){jQuery(tabLink).tab("show");}else{document.querySelectorAll(".nav-tabs li").forEach(function(li){li.classList.remove("active");});tabLink.parentElement.classList.add("active");document.querySelectorAll(".tab-pane").forEach(function(p){p.classList.remove("active");});var pane=document.querySelector(target);if(pane)pane.classList.add("active");}}}';
     // Fix 8: Handle tab clicks to update active indicator and URL hash
     $o .= 'document.querySelectorAll(".nav-tabs a[data-toggle=tab]").forEach(function(a){a.addEventListener("click",function(){document.querySelectorAll(".nav-tabs li").forEach(function(li){li.classList.remove("active");});this.parentElement.classList.add("active");var revMap={"#tab-overview":"#overview","#tab-buckets":"#buckets","#tab-keys":"#accesskeys","#tab-quickstart":"#quickstart","#tab-files":"#files"};var frag=revMap[this.getAttribute("href")]||this.getAttribute("href");history.replaceState(null,null,frag);});});})()';    $o .= '</script>';
 
