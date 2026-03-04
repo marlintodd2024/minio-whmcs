@@ -414,9 +414,9 @@ class MinioClient
         $path = $this->mcAlias . '/' . $bucketName . '/' . $objectKey;
         // If key ends with /, it's a folder — delete recursively
         if (substr($objectKey, -1) === '/') {
-            return $this->mc('rm', ['--recursive', '--force', $path]);
+            return $this->mc('rm', ['--recursive', '--force', '--versions', $path]);
         }
-        return $this->mc('rm', [$path]);
+        return $this->mc('rm', ['--versions', $path]);
     }
 
     /**
