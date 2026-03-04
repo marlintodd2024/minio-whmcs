@@ -418,7 +418,7 @@ class MinioClient
         if (substr($objectKey, -1) === '/') {
             return $this->mc('rm', ['--recursive', '--force', '--versions', $path]);
         }
-        return $this->mc('rm', ['--versions', $path]);
+        return $this->mc('rm', ['--force', '--versions', $path]);
     }
 
     /**
