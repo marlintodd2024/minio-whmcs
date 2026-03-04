@@ -1,15 +1,21 @@
-# WHMCS template cache
-templates_c/
+# Composer
+/vendor/
+composer.lock
 
-# IDE files
+# IDE
 .idea/
 .vscode/
 *.swp
 *.swo
+*~
 
-# OS files
+# OS
 .DS_Store
 Thumbs.db
 
-# Encoded files (if ionCube used later)
-*.encoded.php
+# Build
+/dist/
+*.zip
+
+# Logs
+*.log

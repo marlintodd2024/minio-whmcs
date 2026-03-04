@@ -1,0 +1,106 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  release:
+    types: [published]
+
+jobs:
+  lint:
+    name: PHP Lint
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        php-version: ['7.4', '8.0', '8.1', '8.2', '8.3']
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup PHP
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: ${{ matrix.php-version }}
+          tools: composer
+
+      - name: Syntax check
+        run: |
+          find modules/ includes/ -name "*.php" -exec php -l {} \;
+
+  phpstan:
+    name: Static Analysis
+    runs-on: ubuntu-latest
+    needs: lint
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup PHP
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: '8.1'
+          tools: composer
+
+      - name: Install dependencies
+        run: composer install --no-interaction --prefer-dist
+
+      - name: Run PHPStan
+        run: vendor/bin/phpstan analyse --no-progress
+
+  phpcs:
+    name: Code Style
+    runs-on: ubuntu-latest
+    needs: lint
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup PHP
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: '8.1'
+          tools: composer
+
+      - name: Install dependencies
+        run: composer install --no-interaction --prefer-dist
+
+      - name: Run PHPCS
+        run: vendor/bin/phpcs
+
+  security:
+    name: Security Audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup PHP
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: '8.1'
+          tools: composer
+
+      - name: Install dependencies
+        run: composer install --no-interaction --prefer-dist
+
+      - name: Composer audit
+        run: composer audit
+
+  release-zip:
+    name: Build Release
+    runs-on: ubuntu-latest
+    needs: [lint, phpstan, phpcs]
+    if: github.event_name == 'release'
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build distribution zip
+        run: |
+          mkdir -p dist/minio-whmcs
+          cp -r modules/ dist/minio-whmcs/
+          cp -r includes/ dist/minio-whmcs/
+          cp LICENSE README.md INSTALL.md CHANGELOG.md IMPULSEMINIO_ROADMAP.md dist/minio-whmcs/
+          cd dist && zip -r ../minio-whmcs-${{ github.event.release.tag_name }}.zip minio-whmcs/
+
+      - name: Upload release asset
+        uses: softprops/action-gh-release@v2
+        with:
+          files: minio-whmcs-${{ github.event.release.tag_name }}.zip
