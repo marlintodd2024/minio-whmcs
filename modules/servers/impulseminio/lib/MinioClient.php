@@ -231,7 +231,7 @@ class MinioClient
         $args = [$this->mcAlias, $parentUser];
         $tmpFile = null;
 
-        if ($bucketScope && count($bucketScope) > 0) {
+        if (!empty($bucketScope)) {
             $br = []; $or = [];
             foreach ($bucketScope as $b) { $br[] = 'arn:aws:s3:::' . $b; $or[] = 'arn:aws:s3:::' . $b . '/*'; }
             $policy = json_encode(['Version' => '2012-10-17', 'Statement' => [

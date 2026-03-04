@@ -84,7 +84,7 @@ function impulseminio_MetaData(): array
  * Overage Rate, S3 Endpoint, Console URL, mc Binary Path, Bucket Prefix,
  * Enable Versioning.
  *
- * @return array<int, array{FriendlyName: string, Type: string, Size?: int, Default?: string, Description?: string}>
+ * @return array<string, array<string, mixed>>
  */
 function impulseminio_ConfigOptions(): array
 {
