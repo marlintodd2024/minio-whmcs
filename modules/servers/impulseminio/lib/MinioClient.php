@@ -329,6 +329,8 @@ class MinioClient
             if (!$data) continue;
             $relKey = $data['key'] ?? '';
             if (empty($relKey)) continue;
+            // Hide .keep marker files used for empty folder creation
+            if ($relKey === '.keep' || substr($relKey, -6) === '/.keep') continue;
             $isDir = (!empty($data['type']) && $data['type'] === 'folder')
                   || substr($relKey, -1) === '/';
             // mc ls returns keys relative to the listed path — prepend prefix for full path
