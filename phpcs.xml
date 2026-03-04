@@ -7,14 +7,36 @@
 
     <exclude-pattern>*/templates/*</exclude-pattern>
 
-    <!-- PSR12 base with heavy WHMCS exceptions -->
     <rule ref="PSR12">
+        <!-- WHMCS module conventions -->
         <exclude name="PSR1.Methods.CamelCapsMethodName"/>
         <exclude name="PSR1.Files.SideEffects"/>
         <exclude name="PSR1.Classes.ClassDeclaration"/>
-        <exclude name="PSR2.Files.ClosingTag"/>
         <exclude name="PSR12.Files.FileHeader"/>
-        <exclude name="Generic.Files.LineLength"/>
+
+        <!-- Inline control structures: if (!$x) return 'error'; -->
+        <exclude name="Generic.ControlStructures.InlineControlStructure"/>
+
+        <!-- Brace placement: one-liner closures, compact blocks -->
+        <exclude name="Squiz.WhiteSpace.ScopeClosingBrace"/>
+        <exclude name="Squiz.Functions.MultiLineFunctionDeclaration"/>
+        <exclude name="PSR2.Classes.ClassDeclaration"/>
+        <exclude name="PSR12.Classes.OpeningBraceSpace"/>
+
+        <!-- Statement per line: compact multi-statement lines -->
+        <exclude name="Generic.Formatting.DisallowMultipleStatements"/>
+
+        <!-- Space after FUNCTION keyword in closures -->
+        <exclude name="Squiz.Functions.FunctionDeclaration"/>
+        <exclude name="PSR2.Methods.FunctionClosingBrace"/>
+
+        <!-- Brace on same line for closures/short blocks -->
+        <exclude name="PSR2.ControlStructures.ControlStructureSpacing"/>
+        <exclude name="PSR12.ControlStructures.ControlStructureSpacing"/>
+
+        <!-- Multi-line control structure parenthesis -->
+        <exclude name="PSR2.ControlStructures.SwitchDeclaration"/>
+        <exclude name="PSR12.ControlStructures.BooleanOperatorPlacement"/>
     </rule>
 
     <!-- Generous line length for inline HTML/JS -->
@@ -23,5 +45,10 @@
             <property name="lineLimit" value="500"/>
             <property name="absoluteLineLimit" value="0"/>
         </properties>
+    </rule>
+
+    <!-- Allow concatenation without spaces for compact string building -->
+    <rule ref="Squiz.Strings.ConcatenationSpacing">
+        <severity>0</severity>
     </rule>
 </ruleset>
