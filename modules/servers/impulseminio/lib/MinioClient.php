@@ -355,11 +355,13 @@ class MinioClient
         if (!$r['success']) return ['success' => false, 'url' => '', 'error' => $r['output']];
         // mc outputs: Share: https://...?X-Amz-Signature=...
         if (preg_match('/Share:\s*(https?:\/\/\S+)/', $r['output'], $m)) {
-            return ['success' => true, 'url' => $m[1], 'error' => null];
+            $url = $m[1] . '&response-content-disposition=attachment';
+            return ['success' => true, 'url' => $url, 'error' => null];
         }
         // Fallback: grab any URL with query params
         if (preg_match('/(https?:\/\/\S+\?[^\s"\']+)/', $r['output'], $m)) {
-            return ['success' => true, 'url' => $m[1], 'error' => null];
+            $url = $m[1] . '&response-content-disposition=attachment';
+            return ['success' => true, 'url' => $url, 'error' => null];
         }
         return ['success' => false, 'url' => '', 'error' => 'Could not parse presigned URL from mc output: ' . $r['output']];
     }
@@ -410,6 +412,10 @@ class MinioClient
     {
         $this->ensureAlias();
         $path = $this->mcAlias . '/' . $bucketName . '/' . $objectKey;
+        // If key ends with /, it's a folder — delete recursively
+        if (substr($objectKey, -1) === '/') {
+            return $this->mc('rm', ['--recursive', '--force', $path]);
+        }
         return $this->mc('rm', [$path]);
     }
 
