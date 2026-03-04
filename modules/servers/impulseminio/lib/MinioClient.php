@@ -351,13 +351,13 @@ class MinioClient
         $this->ensureAlias();
         $path = $this->mcAlias . '/' . $bucketName . '/' . $objectKey;
         $expire = '--expire=' . $expireSeconds . 's';
-        // Try with expire before path (newer mc), fall back to after
-        $r = $this->mc('share download', [$expire, $path], false);
-        if (!$r['success']) {
-            $r = $this->mc('share download', [$path, $expire], false);
-        }
+        $r = $this->mc('share download', [$path, $expire], false);
         if (!$r['success']) return ['success' => false, 'url' => '', 'error' => $r['output']];
-        // Extract URL — mc outputs various formats: "Share: https://...", "URL: https://..."
+        // mc outputs: Share: https://...?X-Amz-Signature=...
+        if (preg_match('/Share:\s*(https?:\/\/\S+)/', $r['output'], $m)) {
+            return ['success' => true, 'url' => $m[1], 'error' => null];
+        }
+        // Fallback: grab any URL with query params
         if (preg_match('/(https?:\/\/\S+\?[^\s"\']+)/', $r['output'], $m)) {
             return ['success' => true, 'url' => $m[1], 'error' => null];
         }
@@ -372,15 +372,35 @@ class MinioClient
         $this->ensureAlias();
         $path = $this->mcAlias . '/' . $bucketName . '/' . $objectKey;
         $expire = '--expire=' . $expireSeconds . 's';
-        $r = $this->mc('share upload', [$expire, $path], false);
-        if (!$r['success']) {
-            $r = $this->mc('share upload', [$path, $expire], false);
+        $r = $this->mc('share upload', [$path, $expire], false);
+        if (!$r['success']) return ['success' => false, 'url' => '', 'fields' => [], 'error' => $r['output']];
+
+        // Parse the curl command from mc share upload output
+        // Format: Share: curl https://endpoint/bucket/ -F key=val -F key=val ... -F file=@<FILE>
+        $output = $r['output'];
+
+        // Extract the POST URL from the curl command
+        if (!preg_match('/curl\s+(https?:\/\/\S+)/', $output, $urlMatch)) {
+            return ['success' => false, 'url' => '', 'fields' => [], 'error' => 'Could not parse upload URL from mc output: ' . $output];
         }
-        if (!$r['success']) return ['success' => false, 'url' => '', 'error' => $r['output']];
-        if (preg_match('/(https?:\/\/\S+\?[^\s"\']+)/', $r['output'], $m)) {
-            return ['success' => true, 'url' => $m[1], 'error' => null];
+        $postUrl = $urlMatch[1];
+
+        // Extract all -F field=value pairs (except file=@<FILE>)
+        $fields = [];
+        if (preg_match_all('/-F\s+(\S+?)=(\S+)/', $output, $fieldMatches, PREG_SET_ORDER)) {
+            foreach ($fieldMatches as $fm) {
+                $fieldName = $fm[1];
+                $fieldValue = $fm[2];
+                if ($fieldName === 'file') continue; // skip the file placeholder
+                $fields[$fieldName] = $fieldValue;
+            }
         }
-        return ['success' => false, 'url' => '', 'error' => 'Could not parse presigned URL from mc output: ' . $r['output']];
+
+        if (empty($fields)) {
+            return ['success' => false, 'url' => '', 'fields' => [], 'error' => 'No form fields parsed from mc output: ' . $output];
+        }
+
+        return ['success' => true, 'url' => $postUrl, 'fields' => $fields, 'error' => null];
     }
 
     /**
@@ -394,13 +414,13 @@ class MinioClient
     }
 
     /**
-     * Create a "folder" (empty object with trailing slash) in a bucket.
+     * Create a "folder" in a bucket by placing a .keep marker file inside it.
+     * MinIO rejects object names with trailing slashes, so we create folder/.keep instead.
      */
     public function createFolder(string $bucketName, string $folderPath): array
     {
         $this->ensureAlias();
-        // mc doesn't have a mkdir; we use pipe to create an empty object with trailing slash
-        $path = $this->mcAlias . '/' . $bucketName . '/' . rtrim($folderPath, '/') . '/';
+        $path = $this->mcAlias . '/' . $bucketName . '/' . rtrim($folderPath, '/') . '/.keep';
         $mcBin = escapeshellarg($this->mcPath);
         $target = escapeshellarg($path);
         $cmd = 'echo -n "" | ' . $mcBin . ' pipe ' . $target;
