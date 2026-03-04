@@ -6,7 +6,7 @@
  * management, scoped access keys, usage tracking, and a 4-tab client dashboard.
  *
  * @package    ImpulseMinio
- * @version    2.1.0
+ * @version    2.1.1
  * @author     Impulse Hosting
  * @license    GPL-3.0
  * @link       https://github.com/ImpulseHosting/impulseminio
@@ -44,7 +44,12 @@ function impulseminio_ensureTables(): void
             $t->string('bucket_name', 63)->unique();
             $t->string('label', 100)->default('');
             $t->boolean('is_primary')->default(false);
+            $t->boolean('versioning')->default(false);
             $t->timestamps();
+        });
+    } elseif (!Capsule::schema()->hasColumn('mod_impulseminio_buckets', 'versioning')) {
+        Capsule::schema()->table('mod_impulseminio_buckets', function ($t) {
+            $t->boolean('versioning')->default(false)->after('is_primary');
         });
     }
     if (!Capsule::schema()->hasTable('mod_impulseminio_accesskeys')) {
@@ -257,6 +262,7 @@ function impulseminio_CreateAccount(array $params): string
         $bucket = impulseminio_getBucket($params);
         $password = MinioClient::generatePassword(24);
         $quotaGB = (int)$params['configoption1'];
+        $bwLimitGB = (int)$params['configoption2'];
 
         $r = $client->createUser($username, $password);
         if (!$r['success']) return 'Failed to create user: ' . $r['error'];
@@ -282,7 +288,14 @@ function impulseminio_CreateAccount(array $params): string
             'Bucket Name' => $bucket, 'S3 Endpoint' => $s3Endpoint,
             'Disk Quota (GB)' => $quotaGB > 0 ? (string)$quotaGB : 'Unlimited',
         ]);
-        Capsule::table('tblhosting')->where('id', $params['serviceid'])->update(['username' => $username, 'password' => encrypt($password)]);
+        Capsule::table('tblhosting')->where('id', $params['serviceid'])->update([
+            'username' => $username, 'password' => encrypt($password),
+            'diskusage' => 0,
+            'disklimit' => $quotaGB > 0 ? $quotaGB * 1024 : 0,
+            'bwusage' => 0,
+            'bwlimit' => $bwLimitGB > 0 ? $bwLimitGB * 1024 : 0,
+            'lastupdate' => Capsule::raw('NOW()'),
+        ]);
 
         return 'success';
     } catch (\Exception $e) {
@@ -305,7 +318,12 @@ function impulseminio_SuspendAccount(array $params): string
         $buckets = impulseminio_getAllBuckets((int)$params['serviceid']) ?: [impulseminio_getBucket($params)];
         $r = $client->disableUser($username);
         if (!$r['success']) return 'Failed to suspend: ' . $r['error'];
-        $client->applySuspendedPolicy($username, $buckets);
+        // Policy attach may fail on a disabled user — that's okay, user is already locked out
+        try {
+            $client->applySuspendedPolicy($username, $buckets);
+        } catch (\Exception $pe) {
+            logModuleCall('impulseminio', 'SuspendAccount:policyFallback', ['user' => $username], 'Policy attach failed after disable (non-critical): ' . $pe->getMessage());
+        }
         return 'success';
     } catch (\Exception $e) {
         logModuleCall('impulseminio', __FUNCTION__, $params, $e->getMessage(), $e->getTraceAsString());
@@ -400,12 +418,18 @@ function impulseminio_ChangePackage(array $params): string
     try {
         $client = impulseminio_getClient($params);
         $quotaGB = (int)$params['configoption1'];
+        $bwLimitGB = (int)$params['configoption2'];
         $buckets = impulseminio_getAllBuckets((int)$params['serviceid']) ?: [impulseminio_getBucket($params)];
         foreach ($buckets as $b) {
             if ($quotaGB > 0) $client->setBucketQuota($b, $quotaGB . 'GiB');
             else $client->clearBucketQuota($b);
         }
         $params['model']->serviceProperties->save(['Disk Quota (GB)' => $quotaGB > 0 ? (string)$quotaGB : 'Unlimited']);
+        // Update limits in tblhosting so dashboard reflects new plan immediately
+        Capsule::table('tblhosting')->where('id', $params['serviceid'])->update([
+            'disklimit' => $quotaGB > 0 ? $quotaGB * 1024 : 0,
+            'bwlimit' => $bwLimitGB > 0 ? $bwLimitGB * 1024 : 0,
+        ]);
         return 'success';
     } catch (\Exception $e) { return 'Error: ' . $e->getMessage(); }
 }
@@ -519,6 +543,7 @@ function impulseminio_renderClientArea(array $params = []): string
     $consoleUrl = '';
     $maxBuckets = 5;
     $maxKeys = 10;
+    $versioningAllowed = false;
 
     if (isset($params['model'])) {
         $username = $params['model']->serviceProperties->get('MinIO Username') ?: '';
@@ -527,6 +552,7 @@ function impulseminio_renderClientArea(array $params = []): string
         $consoleUrl = $params['configoption7'] ?? '';
         $maxBuckets = (int)($params['configoption3'] ?: 5);
         $maxKeys = (int)($params['configoption4'] ?: 10);
+        $versioningAllowed = !empty($params['configoption10']);
     } else {
         $fields = Capsule::table('tblcustomfieldsvalues')
             ->join('tblcustomfields', 'tblcustomfields.id', '=', 'tblcustomfieldsvalues.fieldid')
@@ -542,11 +568,25 @@ function impulseminio_renderClientArea(array $params = []): string
                 $consoleUrl = $product->configoption7 ?? '';
                 $maxBuckets = (int)($product->configoption3 ?: 5);
                 $maxKeys = (int)($product->configoption4 ?: 10);
+                $versioningAllowed = !empty($product->configoption10);
             }
         }
     }
 
     $service = Capsule::table('tblhosting')->where('id', $serviceId)->first();
+
+    // Fix 7: Show suspension notice if service is suspended
+    if ($service && strtolower($service->domainstatus) === 'suspended') {
+        $o = '<div class="impulsedrive-dashboard">';
+        $o .= '<div class="alert alert-danger" style="padding:30px;text-align:center;margin-top:20px;">';
+        $o .= '<h3 style="margin-top:0;"><i class="fas fa-exclamation-triangle"></i> Service Suspended</h3>';
+        $o .= '<p style="font-size:16px;">Your cloud storage service is currently suspended. Please contact support or settle any outstanding invoices to restore access.</p>';
+        $o .= '<a href="submitticket.php" class="btn btn-primary" style="margin-top:10px;"><i class="fas fa-envelope"></i> Contact Support</a>';
+        $o .= '</div></div>';
+        $o .= '<style>.impulsedrive-dashboard .alert-danger{background:#f8d7da;border-color:#f5c6cb;color:#721c24;border-radius:6px;}</style>';
+        return $o;
+    }
+
     $diskUsageMB = $service->diskusage ?? 0;
     $diskLimitMB = $service->disklimit ?? 0;
     $bwUsageMB = $service->bwusage ?? 0;
@@ -573,21 +613,40 @@ function impulseminio_renderClientArea(array $params = []): string
     $ee = $esc($s3Endpoint);
     $ec = $esc($consoleUrl);
 
-    // Flash message
+    // Flash message — stored for injection into Access Keys tab
     $o = '';
+    $newKeyFlash = '';
     if (!empty($_SESSION['impulseminio_new_key'])) {
         $nk = $_SESSION['impulseminio_new_key'];
         $eak = $esc($nk['accessKey'] ?? '');
         $esk = $esc($nk['secretKey'] ?? '');
-        $o .= '<div class="alert alert-success alert-dismissible" id="newKeyAlert">';
-        $o .= '<button type="button" class="close" data-dismiss="alert">&times;</button>';
-        $o .= '<h4><i class="fas fa-key"></i> Access Key Created Successfully</h4>';
-        $o .= '<p><strong>Save these credentials now — the secret key will not be shown again.</strong></p>';
-        $o .= '<div class="row" style="margin-top:10px;">';
-        $o .= '<div class="col-md-6"><label>Access Key</label><div class="input-group"><input type="text" class="form-control" id="newAccessKey" value="' . $eak . '" readonly><span class="input-group-btn"><button class="btn btn-default" onclick="idCopy(\'newAccessKey\')"><i class="fas fa-copy"></i></button></span></div></div>';
-        $o .= '<div class="col-md-6"><label>Secret Key</label><div class="input-group"><input type="text" class="form-control" id="newSecretKey" value="' . $esk . '" readonly><span class="input-group-btn"><button class="btn btn-default" onclick="idCopy(\'newSecretKey\')"><i class="fas fa-copy"></i></button></span></div></div>';
-        $o .= '</div></div>';
+        $newKeyFlash .= '<div class="alert alert-success alert-dismissible" id="newKeyAlert">';
+        $newKeyFlash .= '<button type="button" class="close" data-dismiss="alert">&times;</button>';
+        $newKeyFlash .= '<h4><i class="fas fa-key"></i> Access Key Created Successfully</h4>';
+        $newKeyFlash .= '<p><strong>Save these credentials now — the secret key will not be shown again.</strong></p>';
+        $newKeyFlash .= '<div class="row" style="margin-top:10px;">';
+        $newKeyFlash .= '<div class="col-md-6"><label>Access Key</label><div class="input-group"><input type="text" class="form-control" id="newAccessKey" value="' . $eak . '" readonly><span class="input-group-btn"><button class="btn btn-default" onclick="idCopy(\'newAccessKey\')"><i class="fas fa-copy"></i></button></span></div></div>';
+        $newKeyFlash .= '<div class="col-md-6"><label>Secret Key</label><div class="input-group"><input type="text" class="form-control" id="newSecretKey" value="' . $esk . '" readonly><span class="input-group-btn"><button class="btn btn-default" onclick="idCopy(\'newSecretKey\')"><i class="fas fa-copy"></i></button></span></div></div>';
+        $newKeyFlash .= '</div></div>';
         unset($_SESSION['impulseminio_new_key']);
+    }
+
+    // Password reset flash — shown in Overview tab
+    $passwordResetFlash = '';
+    if (!empty($_SESSION['impulseminio_password_reset'])) {
+        $newPw = $esc($_SESSION['impulseminio_password_reset']);
+        $passwordResetFlash .= '<div class="alert alert-warning alert-dismissible" id="pwResetAlert">';
+        $passwordResetFlash .= '<button type="button" class="close" data-dismiss="alert">&times;</button>';
+        $passwordResetFlash .= '<h4><i class="fas fa-sync-alt"></i> Secret Key Reset Successfully</h4>';
+        $passwordResetFlash .= '<p><strong>Your new secret key is shown below. Save it now — it will not be shown again.</strong></p>';
+        $passwordResetFlash .= '<p>All applications using the previous key will need to be updated.</p>';
+        $passwordResetFlash .= '<div class="row" style="margin-top:10px;">';
+        $passwordResetFlash .= '<div class="col-md-8"><label>New Secret Key</label><div class="input-group"><input type="text" class="form-control" id="newPwField" value="' . $newPw . '" readonly style="font-family:monospace;"><span class="input-group-btn"><button class="btn btn-default" onclick="idCopy(\'newPwField\')"><i class="fas fa-copy"></i></button></span></div></div>';
+        $passwordResetFlash .= '</div></div>';
+        // Update the password field on the page
+        $password = $_SESSION['impulseminio_password_reset'];
+        $ep = $esc($password);
+        unset($_SESSION['impulseminio_password_reset']);
     }
 
     // Tabs
@@ -602,6 +661,7 @@ function impulseminio_renderClientArea(array $params = []): string
 
     // === OVERVIEW TAB ===
     $o .= '<div role="tabpanel" class="tab-pane active" id="tab-overview">';
+    $o .= $passwordResetFlash;
 
     // Connection Details
     $o .= '<div class="panel panel-default"><div class="panel-heading"><h3 class="panel-title"><i class="fas fa-cloud"></i> S3 Connection Details</h3></div>';
@@ -613,12 +673,15 @@ function impulseminio_renderClientArea(array $params = []): string
     $o .= '</div>';
     $o .= '<div class="row" style="margin-bottom:15px;">';
     $o .= '<div class="col-md-6"><label>Access Key (Username)</label><div class="input-group"><input type="text" class="form-control" id="accesskey" value="' . $eu . '" readonly><span class="input-group-btn"><button class="btn btn-default" onclick="idCopy(\'accesskey\')" title="Copy"><i class="fas fa-copy"></i></button></span></div></div>';
-    $o .= '<div class="col-md-6"><label>Secret Key (Password)</label><div class="input-group"><input type="password" class="form-control" id="secretkey" value="' . $ep . '" readonly><span class="input-group-btn"><button class="btn btn-default" onclick="togglePw(\'secretkey\')" title="Show/Hide"><i class="fas fa-eye" id="secretkey-eye"></i></button><button class="btn btn-default" onclick="idCopy(\'secretkey\')" title="Copy"><i class="fas fa-copy"></i></button></span></div></div>';
+    $o .= '<div class="col-md-6"><label>Secret Key (Password)</label><div class="input-group"><input type="password" class="form-control" id="secretkey" value="' . $ep . '" readonly><span class="input-group-btn"><button class="btn btn-outline-secondary btn-default" onclick="togglePw(\'secretkey\')" title="Show/Hide"><i class="fas fa-eye" id="secretkey-eye"></i></button><button class="btn btn-default" onclick="idCopy(\'secretkey\')" title="Copy"><i class="fas fa-copy"></i></button></span></div></div>';
     $o .= '</div>';
     $o .= '<div class="row"><div class="col-md-6"><label>Region</label><input type="text" class="form-control" value="us-east-1" readonly></div>';
+    $o .= '<div class="col-md-6"><label>&nbsp;</label><div>';
     if ($consoleUrl) {
-        $o .= '<div class="col-md-6"><label>&nbsp;</label><div><a href="' . $ec . '" target="_blank" class="btn btn-primary"><i class="fas fa-external-link-alt"></i> Open Storage Console</a></div></div>';
+        $o .= '<a href="' . $ec . '" target="_blank" class="btn btn-primary" style="margin-right:8px;"><i class="fas fa-external-link-alt"></i> Open Storage Console</a>';
     }
+    $o .= '<button class="btn btn-warning" onclick="resetPassword()" title="Generate a new secret key"><i class="fas fa-sync-alt"></i> Reset Secret Key</button>';
+    $o .= '</div></div>';
     $o .= '</div>';
     $o .= '</div></div>';
 
@@ -640,24 +703,35 @@ function impulseminio_renderClientArea(array $params = []): string
     $mbDisplay = $maxBuckets > 0 ? $maxBuckets : 'Unlimited';
     $o .= '<div class="panel panel-default"><div class="panel-heading"><h3 class="panel-title"><i class="fas fa-archive"></i> Your Buckets <span class="pull-right" style="font-size:13px;font-weight:normal;">' . $bucketCount . ' / ' . $mbDisplay . '</span></h3></div>';
     $o .= '<div class="panel-body">';
-    $o .= '<table class="table table-striped table-hover"><thead><tr><th>Bucket Name</th><th>Label</th><th>Created</th><th></th></tr></thead><tbody>';
+    $versioningHeader = $versioningAllowed ? '<th>Versioning</th>' : '';
+    $o .= '<table class="table table-striped table-hover"><thead><tr><th>Bucket Name</th><th>Label</th>' . $versioningHeader . '<th>Created</th><th></th></tr></thead><tbody>';
     foreach ($buckets as $b) {
         $bn = $esc($b->bucket_name);
         $bl = $esc($b->label ?: '-');
         $bc = $esc($b->created_at);
         $primary = $b->is_primary ? ' <span class="label label-primary">Primary</span>' : '';
-        $del = !$b->is_primary ? '<button class="btn btn-xs btn-danger" onclick="deleteBucket(\'' . $bn . '\')"><i class="fas fa-trash"></i></button>' : '';
-        $o .= '<tr><td><code>' . $bn . '</code>' . $primary . '</td><td>' . $bl . '</td><td>' . $bc . '</td><td>' . $del . '</td></tr>';
+        $del = !$b->is_primary ? '<button class="btn btn-xs btn-danger" onclick="deleteBucket(\'' . $bn . '\')" title="Delete bucket"><i class="fas fa-trash"></i></button>' : '';
+        $versioningCell = '';
+        if ($versioningAllowed) {
+            $isOn = !empty($b->versioning);
+            $btnClass = $isOn ? 'btn-success' : 'btn-default';
+            $icon = $isOn ? 'fa-check-circle' : 'fa-circle';
+            $label = $isOn ? 'On' : 'Off';
+            $title = $isOn ? 'Click to suspend versioning' : 'Click to enable versioning';
+            $versioningCell = '<td><button class="btn btn-xs ' . $btnClass . '" onclick="toggleVersioning(\'' . $bn . '\')" title="' . $title . '"><i class="fas ' . $icon . '"></i> ' . $label . '</button></td>';
+        }
+        $o .= '<tr><td><code>' . $bn . '</code>' . $primary . '</td><td>' . $bl . '</td>' . $versioningCell . '<td>' . $bc . '</td><td>' . $del . '</td></tr>';
     }
     $o .= '</tbody></table>';
     if ($maxBuckets == 0 || $bucketCount < $maxBuckets) {
-        $o .= '<form method="post" action="clientarea.php?action=productdetails&id=' . $serviceId . '" class="form-inline" style="margin-top:15px;"><input type="hidden" name="modop" value="custom"><input type="hidden" name="a" value="clientCreateBucket"><input type="hidden" name="id" value="' . $serviceId . '">';
-        $o .= '<div class="input-group"><input type="text" name="bucket_name" class="form-control" placeholder="my-bucket-name" required style="width:200px;"><span class="input-group-btn"><button type="submit" class="btn btn-success"><i class="fas fa-plus"></i> Create Bucket</button></span></div></form>';
+        $o .= '<form method="post" action="clientarea.php?action=productdetails&id=' . $serviceId . '#buckets" class="form-inline" style="margin-top:15px;"><input type="hidden" name="modop" value="custom"><input type="hidden" name="a" value="clientCreateBucket"><input type="hidden" name="id" value="' . $serviceId . '">';
+        $o .= '<div class="input-group"><input type="text" name="bucket_name" class="form-control" placeholder="e.g. backups, photos, project-files" required pattern="[a-z0-9][a-z0-9\\-]{1,61}[a-z0-9]" title="3-63 characters: lowercase letters, numbers, and hyphens. Must start and end with a letter or number." style="width:250px;"><span class="input-group-btn"><button type="submit" class="btn btn-success"><i class="fas fa-plus"></i> Create Bucket</button></span></div><p class="help-block text-muted" style="margin-top:5px;font-size:12px;">Lowercase letters, numbers, and hyphens only. This becomes your bucket label.</p></form>';
     }
     $o .= '</div></div></div>';
 
     // === ACCESS KEYS TAB ===
     $o .= '<div role="tabpanel" class="tab-pane" id="tab-keys">';
+    $o .= $newKeyFlash;
     $mkDisplay = $maxKeys > 0 ? $maxKeys : 'Unlimited';
     $o .= '<div class="panel panel-default"><div class="panel-heading"><h3 class="panel-title"><i class="fas fa-key"></i> Access Keys <span class="pull-right" style="font-size:13px;font-weight:normal;">' . $keyCount . ' / ' . $mkDisplay . '</span></h3></div>';
     $o .= '<div class="panel-body">';
@@ -677,7 +751,7 @@ function impulseminio_renderClientArea(array $params = []): string
             $bn = $esc($b->bucket_name);
             $scopeOpts .= '<option value="' . $bn . '">' . $bn . '</option>';
         }
-        $o .= '<form method="post" action="clientarea.php?action=productdetails&id=' . $serviceId . '" class="form-inline" style="margin-top:15px;"><input type="hidden" name="modop" value="custom"><input type="hidden" name="a" value="clientCreateAccessKey"><input type="hidden" name="id" value="' . $serviceId . '">';
+        $o .= '<form method="post" action="clientarea.php?action=productdetails&id=' . $serviceId . '#accesskeys" class="form-inline" style="margin-top:15px;"><input type="hidden" name="modop" value="custom"><input type="hidden" name="a" value="clientCreateAccessKey"><input type="hidden" name="id" value="' . $serviceId . '">';
         $o .= '<div class="form-group" style="margin-right:10px;"><input type="text" name="key_name" class="form-control" placeholder="Label (optional)" style="width:150px;"></div>';
         $o .= '<div class="form-group" style="margin-right:10px;"><select name="bucket_scope" class="form-control">' . $scopeOpts . '</select></div>';
         $o .= '<button type="submit" class="btn btn-success"><i class="fas fa-plus"></i> Create Access Key</button></form>';
@@ -722,9 +796,14 @@ function impulseminio_renderClientArea(array $params = []): string
     $o .= '<script>';
     $o .= 'function idCopy(id){var i=document.getElementById(id),ot=i.type;i.type="text";i.select();i.setSelectionRange(0,99999);navigator.clipboard?navigator.clipboard.writeText(i.value):document.execCommand("copy");i.type=ot;var b=i.closest(".input-group").querySelector("[title=Copy]");if(b){var oh=b.innerHTML;b.innerHTML=\'<i class="fas fa-check text-success"></i>\';setTimeout(function(){b.innerHTML=oh;},1500);}}';
     $o .= 'function togglePw(id){var i=document.getElementById(id),ic=document.getElementById(id+"-eye");if(i.type==="password"){i.type="text";ic.className="fas fa-eye-slash";}else{i.type="password";ic.className="fas fa-eye";}}';
-    $o .= 'var csrfToken=(document.querySelector("input[name=token]")||{}).value||"";function deleteBucket(n){if(!confirm("Delete bucket \\""+n+"\\"? All files will be permanently deleted.")){return;}var f=document.createElement("form");f.method="post";f.innerHTML=\'<input type="hidden" name="token" value="\'+ csrfToken+\'"><input type="hidden" name="modop" value="custom"><input type="hidden" name="a" value="clientDeleteBucket"><input type="hidden" name="id" value="' . $serviceId . '"><input type="hidden" name="bucket_name" value="\'+n+\'">\';document.body.appendChild(f);f.submit();}';
-    $o .= 'function deleteKey(k){if(!confirm("Revoke access key \\""+k+"\\"?")){return;}var f=document.createElement("form");f.method="post";f.innerHTML=\'<input type="hidden" name="token" value="\'+ csrfToken+\'"><input type="hidden" name="modop" value="custom"><input type="hidden" name="a" value="clientDeleteAccessKey"><input type="hidden" name="id" value="' . $serviceId . '"><input type="hidden" name="access_key_id" value="\'+k+\'">\';document.body.appendChild(f);f.submit();}';
-    $o .= '</script>';
+    $o .= 'var csrfToken=(document.querySelector("input[name=token]")||{}).value||"";function deleteBucket(n){if(!confirm("Delete bucket \\""+n+"\\"? All files will be permanently deleted.")){return;}var f=document.createElement("form");f.method="post";f.action="clientarea.php?action=productdetails&id=' . $serviceId . '#buckets";f.innerHTML=\'<input type="hidden" name="token" value="\'+ csrfToken+\'"><input type="hidden" name="modop" value="custom"><input type="hidden" name="a" value="clientDeleteBucket"><input type="hidden" name="id" value="' . $serviceId . '"><input type="hidden" name="bucket_name" value="\'+n+\'">\';document.body.appendChild(f);f.submit();}';
+    $o .= 'function deleteKey(k){if(!confirm("Revoke access key \\""+k+"\\"?")){return;}var f=document.createElement("form");f.method="post";f.action="clientarea.php?action=productdetails&id=' . $serviceId . '#accesskeys";f.innerHTML=\'<input type="hidden" name="token" value="\'+ csrfToken+\'"><input type="hidden" name="modop" value="custom"><input type="hidden" name="a" value="clientDeleteAccessKey"><input type="hidden" name="id" value="' . $serviceId . '"><input type="hidden" name="access_key_id" value="\'+k+\'">\';document.body.appendChild(f);f.submit();}';
+    $o .= 'function toggleVersioning(n){var msg=confirm("Toggle versioning on bucket \\""+n+"\\"?")?true:false;if(!msg)return;var f=document.createElement("form");f.method="post";f.action="clientarea.php?action=productdetails&id=' . $serviceId . '#buckets";f.innerHTML=\'<input type="hidden" name="token" value="\'+ csrfToken+\'"><input type="hidden" name="modop" value="custom"><input type="hidden" name="a" value="clientToggleVersioning"><input type="hidden" name="id" value="' . $serviceId . '"><input type="hidden" name="bucket_name" value="\'+n+\'">\';document.body.appendChild(f);f.submit();}';
+    $o .= 'function resetPassword(){if(!confirm("Reset your secret key? Your current key will stop working immediately. You will need to update all applications using the current key.")){return;}var f=document.createElement("form");f.method="post";f.action="clientarea.php?action=productdetails&id=' . $serviceId . '#overview";f.innerHTML=\'<input type="hidden" name="token" value="\'+ csrfToken+\'"><input type="hidden" name="modop" value="custom"><input type="hidden" name="a" value="clientResetPassword"><input type="hidden" name="id" value="' . $serviceId . '">\';document.body.appendChild(f);f.submit();}';
+    // Fix 8: Activate correct tab from URL hash on page load
+    $o .= '(function(){var h=window.location.hash;if(h){var map={"#buckets":"#tab-buckets","#accesskeys":"#tab-keys","#quickstart":"#tab-quickstart","#overview":"#tab-overview"};var target=map[h]||h;var tabLink=document.querySelector(\'.nav-tabs a[href="\'+target+\'"]\');if(tabLink){var evt=document.createEvent("HTMLEvents");evt.initEvent("click",true,true);tabLink.dispatchEvent(evt);if(typeof jQuery!=="undefined"){jQuery(tabLink).tab("show");}else{document.querySelectorAll(".nav-tabs li").forEach(function(li){li.classList.remove("active");});tabLink.parentElement.classList.add("active");document.querySelectorAll(".tab-pane").forEach(function(p){p.classList.remove("active");});var pane=document.querySelector(target);if(pane)pane.classList.add("active");}}}';
+    // Fix 8: Handle tab clicks to update active indicator and URL hash
+    $o .= 'document.querySelectorAll(".nav-tabs a[data-toggle=tab]").forEach(function(a){a.addEventListener("click",function(){document.querySelectorAll(".nav-tabs li").forEach(function(li){li.classList.remove("active");});this.parentElement.classList.add("active");var revMap={"#tab-overview":"#overview","#tab-buckets":"#buckets","#tab-keys":"#accesskeys","#tab-quickstart":"#quickstart"};var frag=revMap[this.getAttribute("href")]||this.getAttribute("href");history.replaceState(null,null,frag);});});})()';    $o .= '</script>';
 
     // CSS
     $o .= '<style>';
@@ -740,8 +819,12 @@ function impulseminio_renderClientArea(array $params = []): string
     $o .= '.impulsedrive-dashboard table code{background:#f4f4f4;padding:2px 6px;border-radius:3px;font-size:12px}';
     $o .= '#newKeyAlert{background:#d4edda;border-color:#c3e6cb}';
     $o .= '#newKeyAlert input.form-control{font-family:monospace;font-size:13px;background:#fff}';
+    $o .= '.impulsedrive-dashboard .btn-outline-secondary{background:transparent;border-color:#6c757d;color:#6c757d}';
+    $o .= '.impulsedrive-dashboard .btn-outline-secondary:hover{background:#6c757d;color:#fff}';
     $o .= '</style>';
-    $o .= '<script>document.addEventListener("DOMContentLoaded",function(){document.querySelectorAll("a").forEach(function(a){var t=a.textContent.trim();if(t=="Create Bucket"||t=="Delete Bucket"||t=="Create Access Key"||t=="Delete Access Key"){a.style.display="none";}});});</script>';
+    // Fix 5: Clear flash messages when switching tabs
+    $o .= '<script>document.addEventListener("DOMContentLoaded",function(){document.querySelectorAll(".nav-tabs a[data-toggle=tab]").forEach(function(a){a.addEventListener("click",function(){document.querySelectorAll(".impulsedrive-dashboard > .alert").forEach(function(el){el.style.display="none";});});});';
+    $o .= 'document.querySelectorAll("a").forEach(function(a){var t=a.textContent.trim();if(t=="Create Bucket"||t=="Delete Bucket"||t=="Create Access Key"||t=="Delete Access Key"||t=="Toggle Versioning"||t=="Reset Password"){a.style.display="none";}});});</script>';
 
     return $o;
 }
@@ -761,6 +844,8 @@ function impulseminio_ClientAreaCustomButtonArray(): array
         'Delete Bucket' => 'clientDeleteBucket',
         'Create Access Key' => 'clientCreateAccessKey',
         'Delete Access Key' => 'clientDeleteAccessKey',
+        'Toggle Versioning' => 'clientToggleVersioning',
+        'Reset Password' => 'clientResetPassword',
     ];
 }
 
@@ -785,8 +870,13 @@ function impulseminio_clientCreateBucket(array $params): string
             return 'Bucket limit reached (' . $maxBuckets . '). Upgrade your plan for more buckets.';
         }
 
-        $rawName = isset($_POST['bucket_name']) ? trim($_POST['bucket_name']) : '';
+        $rawName = isset($_POST['bucket_name']) ? strtolower(trim($_POST['bucket_name'])) : '';
         if (empty($rawName)) return 'Please provide a bucket name.';
+        if (strlen($rawName) < 3) return 'Bucket name must be at least 3 characters.';
+        if (strlen($rawName) > 63) return 'Bucket name must be 63 characters or fewer.';
+        if (!preg_match('/^[a-z0-9][a-z0-9\-]*[a-z0-9]$/', $rawName)) {
+            return 'Bucket name can only contain lowercase letters, numbers, and hyphens. Must start and end with a letter or number.';
+        }
 
         // Prefix with username for namespace isolation
         $username = impulseminio_getUsername($params);
@@ -847,6 +937,20 @@ function impulseminio_clientDeleteBucket(array $params): string
         $client = impulseminio_getClient($params);
         $r = $client->deleteBucket($bucketName, true);
         if (!$r['success']) return 'Failed to delete bucket: ' . $r['error'];
+
+        // Auto-revoke access keys scoped to this bucket
+        $scopedKeys = Capsule::table('mod_impulseminio_accesskeys')
+            ->where('service_id', $serviceId)
+            ->whereNotNull('bucket_scope')
+            ->get();
+        foreach ($scopedKeys as $sk) {
+            $scopes = json_decode($sk->bucket_scope, true);
+            if (is_array($scopes) && in_array($bucketName, $scopes)) {
+                $client->deleteAccessKey($sk->access_key);
+                Capsule::table('mod_impulseminio_accesskeys')->where('id', $sk->id)->delete();
+                logModuleCall('impulseminio', 'clientDeleteBucket:revokeOrphanKey', ['key' => $sk->access_key, 'bucket' => $bucketName], 'Revoked scoped key');
+            }
+        }
 
         Capsule::table('mod_impulseminio_buckets')->where('id', $bucket->id)->delete();
 
@@ -946,6 +1050,93 @@ function impulseminio_clientDeleteAccessKey(array $params): string
         if (!$r['success']) return 'Failed to delete access key: ' . $r['error'];
 
         Capsule::table('mod_impulseminio_accesskeys')->where('id', $key->id)->delete();
+        return 'success';
+    } catch (\Exception $e) {
+        logModuleCall('impulseminio', __FUNCTION__, $params, $e->getMessage(), $e->getTraceAsString());
+        return 'Error: ' . $e->getMessage();
+    }
+}
+
+/**
+ * Client action: toggle versioning on a bucket.
+ *
+ * Enables or suspends S3 versioning depending on current state.
+ * Requires configoption10 (Enable Versioning) to be enabled on the product.
+ *
+ * @param  array  $params WHMCS module parameters
+ * @return string "success" or error message
+ */
+function impulseminio_clientToggleVersioning(array $params): string
+{
+    try {
+        impulseminio_ensureTables();
+        $serviceId = (int)$params['serviceid'];
+
+        // Check if versioning feature is enabled on this product
+        $versioningAllowed = !empty($params['configoption10']);
+        if (!$versioningAllowed) {
+            return 'Versioning is not available on your current plan.';
+        }
+
+        $bucketName = isset($_POST['bucket_name']) ? trim($_POST['bucket_name']) : '';
+        if (empty($bucketName)) return 'No bucket specified.';
+
+        // Verify ownership
+        $bucket = Capsule::table('mod_impulseminio_buckets')
+            ->where('service_id', $serviceId)->where('bucket_name', $bucketName)->first();
+        if (!$bucket) return 'Bucket not found or not owned by this service.';
+
+        $client = impulseminio_getClient($params);
+        $currentlyEnabled = !empty($bucket->versioning);
+
+        if ($currentlyEnabled) {
+            $r = $client->suspendVersioning($bucketName);
+            if (!$r['success']) return 'Failed to suspend versioning: ' . $r['error'];
+            Capsule::table('mod_impulseminio_buckets')->where('id', $bucket->id)->update([
+                'versioning' => false, 'updated_at' => date('Y-m-d H:i:s'),
+            ]);
+        } else {
+            $r = $client->enableVersioning($bucketName);
+            if (!$r['success']) return 'Failed to enable versioning: ' . $r['error'];
+            Capsule::table('mod_impulseminio_buckets')->where('id', $bucket->id)->update([
+                'versioning' => true, 'updated_at' => date('Y-m-d H:i:s'),
+            ]);
+        }
+
+        return 'success';
+    } catch (\Exception $e) {
+        logModuleCall('impulseminio', __FUNCTION__, $params, $e->getMessage(), $e->getTraceAsString());
+        return 'Error: ' . $e->getMessage();
+    }
+}
+
+/**
+ * Client action: reset the MinIO secret key (password).
+ *
+ * Generates a new password, updates MinIO user, stores in WHMCS,
+ * and flashes the new credentials to session for display.
+ *
+ * @param  array  $params WHMCS module parameters
+ * @return string "success" or error message
+ */
+function impulseminio_clientResetPassword(array $params): string
+{
+    try {
+        $client = impulseminio_getClient($params);
+        $username = impulseminio_getUsername($params);
+        $newPassword = MinioClient::generatePassword(24);
+
+        $r = $client->createUser($username, $newPassword);
+        if (!$r['success']) return 'Failed to reset password: ' . $r['error'];
+
+        $params['model']->serviceProperties->save(['MinIO Password' => $newPassword]);
+        Capsule::table('tblhosting')->where('id', $params['serviceid'])->update([
+            'password' => encrypt($newPassword),
+        ]);
+
+        // Flash the new password so it's shown once
+        $_SESSION['impulseminio_password_reset'] = $newPassword;
+
         return 'success';
     } catch (\Exception $e) {
         logModuleCall('impulseminio', __FUNCTION__, $params, $e->getMessage(), $e->getTraceAsString());
