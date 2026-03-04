@@ -17,7 +17,7 @@
         <!-- Inline control structures: if (!$x) return 'error'; -->
         <exclude name="Generic.ControlStructures.InlineControlStructure"/>
 
-        <!-- Brace placement: one-liner closures, compact blocks -->
+        <!-- Brace placement: one-liner closures and compact blocks -->
         <exclude name="Squiz.WhiteSpace.ScopeClosingBrace"/>
         <exclude name="Squiz.Functions.MultiLineFunctionDeclaration"/>
         <exclude name="PSR2.Classes.ClassDeclaration"/>
@@ -33,22 +33,40 @@
         <!-- Brace on same line for closures/short blocks -->
         <exclude name="PSR2.ControlStructures.ControlStructureSpacing"/>
         <exclude name="PSR12.ControlStructures.ControlStructureSpacing"/>
-
-        <!-- Multi-line control structure parenthesis -->
-        <exclude name="PSR2.ControlStructures.SwitchDeclaration"/>
         <exclude name="PSR12.ControlStructures.BooleanOperatorPlacement"/>
+
+        <!-- Newline after opening brace — conflicts with one-liner blocks -->
+        <exclude name="Squiz.WhiteSpace.ScopeKeywordSpacing"/>
+        <exclude name="PSR12.Classes.ClosingBrace"/>
     </rule>
 
-    <!-- Generous line length for inline HTML/JS -->
+    <!-- Disable line length entirely — inline HTML/JS output makes this impractical -->
     <rule ref="Generic.Files.LineLength">
+        <severity>0</severity>
+    </rule>
+
+    <!-- Allow concatenation without spaces -->
+    <rule ref="Squiz.Strings.ConcatenationSpacing">
+        <severity>0</severity>
+    </rule>
+
+    <!-- Allow compact operator spacing (e.g., $x*1024) -->
+    <rule ref="PSR12.Operators.OperatorSpacing">
+        <severity>0</severity>
+    </rule>
+
+    <!-- Allow opening brace on same line as content -->
+    <rule ref="Generic.WhiteSpace.ScopeIndent">
         <properties>
-            <property name="lineLimit" value="500"/>
-            <property name="absoluteLineLimit" value="0"/>
+            <property name="ignoreIndentationTokens" type="array">
+                <element value="T_COMMENT"/>
+                <element value="T_DOC_COMMENT_OPEN_TAG"/>
+            </property>
         </properties>
     </rule>
 
-    <!-- Allow concatenation without spaces for compact string building -->
-    <rule ref="Squiz.Strings.ConcatenationSpacing">
+    <!-- Disable brace-on-newline requirements for compact blocks -->
+    <rule ref="Squiz.ControlStructures.ControlSignature">
         <severity>0</severity>
     </rule>
 </ruleset>
