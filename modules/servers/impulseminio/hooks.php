@@ -1,149 +1,94 @@
 <?php
 /**
- * Impulse Hosting - MinIO Module Hooks
+ * ImpulseMinio — Client Area Hooks
  *
- * Handles:
- * - Bandwidth overage billing (monthly invoice generation)
- * - Welcome email data injection
- * - Service cancellation cleanup
+ * Injects suspension notice and hides sidebar action links for
+ * ImpulseMinio services via footer output hook that fires
+ * regardless of whether Lagom renders the module template.
  *
  * @package ImpulseMinio
  */
 
-if (!defined('WHMCS')) {
-    die('This file cannot be accessed directly.');
-}
-
 use WHMCS\Database\Capsule;
 
-/**
- * Hook: After the daily cron runs, check for bandwidth overages and generate
- * overage invoice line items.
- *
- * This runs after UsageUpdate has populated tblhosting with current bandwidth data.
- * Only processes services where the product has a non-zero overage rate (configoption5).
- */
-add_hook('AfterCronJob', 1, function ($vars) {
-    // Only run on the 1st of each month (process previous month's overages)
-    if (date('j') !== '1') {
+add_hook('ClientAreaFooterOutput', 1, function($vars) {
+    if (($vars['filename'] ?? '') !== 'clientarea' || ($_GET['action'] ?? '') !== 'productdetails') {
         return;
     }
 
-    try {
-        // Find all active impulseminio services with bandwidth overages
-        $services = Capsule::table('tblhosting')
-            ->join('tblproducts', 'tblhosting.packageid', '=', 'tblproducts.id')
-            ->where('tblproducts.servertype', 'impulseminio')
-            ->where('tblhosting.domainstatus', 'Active')
-            ->where('tblhosting.bwlimit', '>', 0)
-            ->whereRaw('tblhosting.bwusage > tblhosting.bwlimit')
-            ->select([
-                'tblhosting.id as serviceid',
-                'tblhosting.userid',
-                'tblhosting.bwusage',
-                'tblhosting.bwlimit',
-                'tblproducts.configoption5 as overage_rate',
-                'tblproducts.name as product_name',
-            ])
-            ->get();
+    $serviceId = (int)($_GET['id'] ?? 0);
+    if (!$serviceId) return;
 
-        foreach ($services as $service) {
-            $overageRate = (float) $service->overage_rate;
-
-            // Skip if no overage rate configured
-            if ($overageRate <= 0) {
-                continue;
-            }
-
-            // Calculate overage in GB
-            $overageGB = round(($service->bwusage - $service->bwlimit) / 1024, 2); // MB to GB
-            $overageAmount = round($overageGB * $overageRate, 2);
-
-            if ($overageAmount <= 0) {
-                continue;
-            }
-
-            $previousMonth = date('F Y', strtotime('-1 month'));
-
-            // Use WHMCS API to create an invoice
-            $command = 'CreateInvoice';
-            $postData = [
-                'userid'      => $service->userid,
-                'status'      => 'Unpaid',
-                'sendinvoice' => '1',
-                'date'        => date('Y-m-d'),
-                'duedate'     => date('Y-m-d', strtotime('+7 days')),
-                'itemdescription1' => sprintf(
-                    'Bandwidth Overage - %s (%s): %.2f GB over limit @ $%.2f/GB',
-                    $service->product_name,
-                    $previousMonth,
-                    $overageGB,
-                    $overageRate
-                ),
-                'itemamount1'  => $overageAmount,
-                'itemtaxed1'   => '0',
-            ];
-
-            $results = localAPI($command, $postData);
-
-            logModuleCall('impulseminio', 'BandwidthOverage', [
-                'serviceId'    => $service->serviceid,
-                'overageGB'    => $overageGB,
-                'overageAmount' => $overageAmount,
-            ], $results);
-        }
-
-    } catch (\Exception $e) {
-        logActivity('ImpulseMinio Overage Hook Error: ' . $e->getMessage());
-    }
-});
-
-/**
- * Hook: Inject S3 credentials into welcome email merge fields.
- *
- * Makes the following merge fields available in email templates:
- * {$service_custom_field_MinIO_Username}
- * {$service_custom_field_MinIO_Password}
- * {$service_custom_field_Bucket_Name}
- * {$service_custom_field_S3_Endpoint}
- *
- * These are automatically available via service properties, but this hook
- * ensures they're also available as standard merge fields.
- */
-add_hook('EmailPreSend', 1, function ($vars) {
-    // Only process for product welcome emails
-    if (!in_array($vars['messagename'], ['Product Welcome Email', 'New Product Information'])) {
-        return;
-    }
-
-    $serviceId = $vars['relid'] ?? 0;
-    if (!$serviceId) {
-        return;
-    }
-
-    // Check if this is an impulseminio service
     $service = Capsule::table('tblhosting')
-        ->join('tblproducts', 'tblhosting.packageid', '=', 'tblproducts.id')
+        ->join('tblproducts', 'tblproducts.id', '=', 'tblhosting.packageid')
         ->where('tblhosting.id', $serviceId)
-        ->where('tblproducts.servertype', 'impulseminio')
+        ->select('tblhosting.domainstatus', 'tblhosting.suspendreason', 'tblproducts.servertype')
         ->first();
 
-    if (!$service) {
-        return;
+    if (!$service || $service->servertype !== 'impulseminio') return;
+
+    $isSuspended = strtolower($service->domainstatus) === 'suspended';
+
+    $js = 'document.addEventListener("DOMContentLoaded", function() {';
+
+    // Always hide module action links from sidebar
+    $js .= '  var hideLabels = ["Create Bucket", "Delete Bucket", "Create Access Key", "Delete Access Key", "Toggle Versioning", "Reset Password"];';
+    $js .= '  document.querySelectorAll("a").forEach(function(a) {';
+    $js .= '    var t = a.textContent.trim();';
+    $js .= '    if (hideLabels.indexOf(t) !== -1) {';
+    $js .= '      var li = a.closest("li, .list-group-item");';
+    $js .= '      if (li) li.style.display = "none"; else a.style.display = "none";';
+    $js .= '    }';
+    $js .= '  });';
+
+    if ($isSuspended) {
+        $reason = addslashes(htmlspecialchars($service->suspendreason ?? '', ENT_QUOTES, 'UTF-8'));
+        $reasonLine = $reason ? '<p style=\"margin-top:12px;margin-bottom:0;font-size:14px;\"><strong>Reason:</strong> ' . $reason . '</p>' : '';
+
+        $js .= '  var bannerHtml = \'';
+        $js .= '<div id="impulseminio-suspended" style="max-width:600px;margin:60px auto;padding:45px 35px;text-align:center;background:#fff;border:1px solid #e0e0e0;border-radius:12px;box-shadow:0 2px 12px rgba(0,0,0,0.08);">';
+        $js .= '<div style="width:64px;height:64px;margin:0 auto 20px;background:#f8d7da;border-radius:50%;display:flex;align-items:center;justify-content:center;"><i class="fas fa-lock" style="font-size:28px;color:#721c24;"></i></div>';
+        $js .= '<h2 style="margin:0 0 12px;color:#333;font-weight:600;">Service Suspended</h2>';
+        $js .= '<p style="font-size:15px;color:#666;margin-bottom:5px;">Your cloud storage service is currently suspended.</p>';
+        $js .= '<p style="font-size:15px;color:#666;">Please contact support or settle any outstanding invoices to restore access.</p>';
+        $js .= $reasonLine;
+        $js .= '<a href="clientarea.php?action=invoices" class="btn btn-primary" style="margin-top:20px;padding:10px 30px;font-size:15px;border-radius:6px;"><i class="fas fa-file-invoice-dollar" style="margin-right:8px;"></i>View Invoices</a>';
+        $js .= '<a href="submitticket.php" class="btn btn-outline-secondary" style="margin-top:20px;margin-left:10px;padding:10px 30px;font-size:15px;border-radius:6px;border:1px solid #6c757d;color:#6c757d;background:transparent;text-decoration:none;"><i class="fas fa-envelope" style="margin-right:8px;"></i>Contact Support</a>';
+        $js .= '</div>\';';
+
+        $js .= '  var banner = document.createElement("div");';
+        $js .= '  banner.innerHTML = bannerHtml;';
+
+        // Insert after breadcrumb row, hide everything after
+        $js .= '  var heading = document.querySelector("h1, .page-title, .breadcrumb");';
+        $js .= '  if (heading) {';
+        $js .= '    var parent = heading.closest(".row, .container, .container-fluid, section, header");';
+        $js .= '    if (parent && parent.parentNode) {';
+        $js .= '      parent.parentNode.insertBefore(banner, parent.nextSibling);';
+        $js .= '    }';
+        $js .= '  } else {';
+        $js .= '    var main = document.querySelector("main, .main-content, #main-body");';
+        $js .= '    if (main) main.insertBefore(banner, main.firstChild);';
+        $js .= '  }';
+
+        // Hide everything after the banner - walk up parents until we find siblings to hide
+        $js .= '  var el = document.getElementById("impulseminio-suspended");';
+        $js .= '  if (el) {';
+        $js .= '    var node = el;';
+        // Walk up until we find a parent that has sibling elements after it
+        $js .= '    for (var i = 0; i < 5; i++) {';
+        $js .= '      if (node.parentNode && node.parentNode.nextElementSibling) { node = node.parentNode; break; }';
+        $js .= '      if (node.parentNode) node = node.parentNode;';
+        $js .= '    }';
+        $js .= '    var sibling = node.nextElementSibling;';
+        $js .= '    while (sibling) {';
+        $js .= '      sibling.style.display = "none";';
+        $js .= '      sibling = sibling.nextElementSibling;';
+        $js .= '    }';
+        $js .= '  }';
     }
 
-    // Get service properties (custom fields)
-    $fields = Capsule::table('tblcustomfieldsvalues')
-        ->join('tblcustomfields', 'tblcustomfields.id', '=', 'tblcustomfieldsvalues.fieldid')
-        ->where('tblcustomfieldsvalues.relid', $serviceId)
-        ->pluck('tblcustomfieldsvalues.value', 'tblcustomfields.fieldname');
+    $js .= '});';
 
-    $mergeFields = [];
-    foreach ($fields as $name => $value) {
-        // Convert field name to merge field format
-        $key = 'minio_' . strtolower(str_replace([' ', '(', ')'], ['_', '', ''], $name));
-        $mergeFields[$key] = $value;
-    }
-
-    return $mergeFields;
+    return '<script>' . $js . '</script>';
 });
