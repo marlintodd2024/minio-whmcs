@@ -2,16 +2,36 @@
 
 ## 1. Upload Module Files
 
-Copy the `modules/servers/impulseminio/` directory to your WHMCS installation:
+Copy the module directory to your WHMCS installation:
 
 ```
-whmcs/modules/servers/impulseminio/
-├── impulseminio.php
-├── hooks.php
-├── lib/
-│   └── MinioClient.php
-└── templates/
-    └── clientarea.tpl
+modules/servers/impulseminio/  →  {whmcs}/modules/servers/impulseminio/
+```
+
+Then copy the display hook to the WHMCS hooks directory:
+
+```
+includes/hooks/impulseminio_hooks.php  →  {whmcs}/includes/hooks/impulseminio_hooks.php
+```
+
+**Why two hook files?** The module-level `hooks.php` handles addon storage recalculation (billing events). The `includes/hooks/` file handles the suspension banner and sidebar cleanup. It must live there because Lagom and some WHMCS themes skip loading the module entirely for suspended services — a module-level hook would never fire when it's needed most.
+
+Your final structure should look like:
+
+```
+whmcs/
+├── includes/
+│   └── hooks/
+│       └── impulseminio_hooks.php      ← suspension banner + sidebar hiding
+└── modules/
+    └── servers/
+        └── impulseminio/
+            ├── impulseminio.php         ← main module
+            ├── hooks.php               ← addon storage recalculation
+            ├── lib/
+            │   └── MinioClient.php     ← mc CLI wrapper
+            └── templates/
+                └── clientarea.tpl      ← Smarty template
 ```
 
 ## 2. Install MinIO `mc` CLI
@@ -70,13 +90,21 @@ Create addons for extra storage:
 
 The `hooks.php` addon hook automatically recalculates disk limits when addons are activated, suspended, or terminated.
 
-## 6. Hooks Registration
+## 6. Hooks Verification
 
-WHMCS auto-loads `hooks.php` from the module directory. Verify hooks are active:
+WHMCS auto-loads hooks from both locations:
+
+- `includes/hooks/impulseminio_hooks.php` — loaded on every page (handles suspension banner)
+- `modules/servers/impulseminio/hooks.php` — loaded when module is active (handles addon storage)
+
+The display hook has a duplicate guard (`IMPULSEMINIO_DISPLAY_HOOK_LOADED`) so it won't fire twice if accidentally loaded from both locations.
+
+To verify hooks are working:
 
 1. Go to **WHMCS Admin → Utilities → Logs → Module Log**
 2. Enable module logging temporarily
 3. Test an addon activation — you should see `addonStorageRecalc` entries
+4. Suspend a test service — verify the banner appears in the client area
 
 ## 7. Database Tables
 
