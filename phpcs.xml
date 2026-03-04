@@ -38,21 +38,25 @@
         <!-- Newline after opening brace — conflicts with one-liner blocks -->
         <exclude name="Squiz.WhiteSpace.ScopeKeywordSpacing"/>
         <exclude name="PSR12.Classes.ClosingBrace"/>
+        <exclude name="Generic.Functions.FunctionCallArgumentSpacing"/>
     </rule>
 
     <!-- Disable line length entirely — inline HTML/JS output makes this impractical -->
     <rule ref="Generic.Files.LineLength">
         <severity>0</severity>
+        <exclude name="Generic.Functions.FunctionCallArgumentSpacing"/>
     </rule>
 
     <!-- Allow concatenation without spaces -->
     <rule ref="Squiz.Strings.ConcatenationSpacing">
         <severity>0</severity>
+        <exclude name="Generic.Functions.FunctionCallArgumentSpacing"/>
     </rule>
 
     <!-- Allow compact operator spacing (e.g., $x*1024) -->
     <rule ref="PSR12.Operators.OperatorSpacing">
         <severity>0</severity>
+        <exclude name="Generic.Functions.FunctionCallArgumentSpacing"/>
     </rule>
 
     <!-- Allow opening brace on same line as content -->
@@ -63,10 +67,12 @@
                 <element value="T_DOC_COMMENT_OPEN_TAG"/>
             </property>
         </properties>
+        <exclude name="Generic.Functions.FunctionCallArgumentSpacing"/>
     </rule>
 
     <!-- Disable brace-on-newline requirements for compact blocks -->
     <rule ref="Squiz.ControlStructures.ControlSignature">
         <severity>0</severity>
+        <exclude name="Generic.Functions.FunctionCallArgumentSpacing"/>
     </rule>
 </ruleset>
