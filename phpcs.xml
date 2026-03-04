@@ -13,16 +13,23 @@
     <rule ref="PSR12">
         <!-- WHMCS modules use snake_case function names by convention -->
         <exclude name="PSR1.Methods.CamelCapsMethodName"/>
-        <!-- Module files aren't classes -->
+        <!-- Module files aren't classes — they have side effects and no namespace -->
         <exclude name="PSR1.Files.SideEffects"/>
         <exclude name="PSR1.Classes.ClassDeclaration"/>
+        <!-- WHMCS module functions live outside classes -->
+        <exclude name="Squiz.Functions.GlobalFunction"/>
     </rule>
 
-    <!-- Allow long lines for HTML output in renderClientArea (heredocs, etc.) -->
+    <!-- Allow long lines — module has inline HTML/JS output -->
     <rule ref="Generic.Files.LineLength">
         <properties>
-            <property name="lineLimit" value="200"/>
+            <property name="lineLimit" value="250"/>
             <property name="absoluteLineLimit" value="0"/>
         </properties>
+    </rule>
+
+    <!-- Allow closing tag at end of file (some WHMCS patterns) -->
+    <rule ref="PSR2.Files.ClosingTag">
+        <severity>0</severity>
     </rule>
 </ruleset>

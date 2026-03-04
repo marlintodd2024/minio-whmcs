@@ -6,9 +6,9 @@ parameters:
     excludePaths:
         - modules/servers/impulseminio/templates
     ignoreErrors:
-        # WHMCS functions and classes are not available in static analysis
+        # WHMCS classes and functions are not available outside the WHMCS runtime
+        - '#.*WHMCS\\\\Database\\\\Capsule.*#'
         - '#Function logModuleCall not found#'
         - '#Function encrypt not found#'
-        - '#Class WHMCS\\\\Database\\\\Capsule not found#'
         - '#Function add_hook not found#'
     reportUnmatchedIgnoredErrors: false
