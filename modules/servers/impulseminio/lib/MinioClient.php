@@ -318,8 +318,8 @@ class MinioClient
         $path = $this->mcAlias . '/' . $bucketName;
         if ($prefix) $path .= '/' . rtrim($prefix, '/') . '/';
         $args = [$path];
-        if (!$recursive) $args[] = '--incomplete'; // placeholder — mc ls is non-recursive by default
-        $r = $this->mc('ls', [$path], true);
+        if ($recursive) $args[] = '--recursive';
+        $r = $this->mc('ls', $args, true);
         if (!$r['success']) return ['success' => false, 'objects' => [], 'error' => $r['output']];
 
         $objects = [];
@@ -327,13 +327,14 @@ class MinioClient
         foreach ($lines as $line) {
             $data = json_decode($line, true);
             if (!$data) continue;
-            $key = $data['key'] ?? '';
-            if (empty($key)) continue;
-            $isDir = !empty($data['type']) && $data['type'] === 'folder';
-            // Also detect directories by trailing slash
-            if (substr($key, -1) === '/') $isDir = true;
+            $relKey = $data['key'] ?? '';
+            if (empty($relKey)) continue;
+            $isDir = (!empty($data['type']) && $data['type'] === 'folder')
+                  || substr($relKey, -1) === '/';
+            // mc ls returns keys relative to the listed path — prepend prefix for full path
+            $fullKey = $prefix . $relKey;
             $objects[] = [
-                'key'          => $key,
+                'key'          => $fullKey,
                 'size'         => (int)($data['size'] ?? 0),
                 'lastModified' => $data['lastModified'] ?? '',
                 'type'         => $isDir ? 'folder' : 'file',
@@ -349,11 +350,18 @@ class MinioClient
     {
         $this->ensureAlias();
         $path = $this->mcAlias . '/' . $bucketName . '/' . $objectKey;
-        $r = $this->mc('share download', [$path, '--expire=' . $expireSeconds . 's'], false);
+        $expire = '--expire=' . $expireSeconds . 's';
+        // Try with expire before path (newer mc), fall back to after
+        $r = $this->mc('share download', [$expire, $path], false);
+        if (!$r['success']) {
+            $r = $this->mc('share download', [$path, $expire], false);
+        }
         if (!$r['success']) return ['success' => false, 'url' => '', 'error' => $r['output']];
-        // Extract URL from output — mc outputs: "URL: https://..."
-        preg_match('/(?:Share|URL):\s*(https?:\/\/\S+)/', $r['output'], $m);
-        return ['success' => !empty($m[1]), 'url' => $m[1] ?? '', 'error' => empty($m[1]) ? 'Could not parse URL' : null];
+        // Extract URL — mc outputs various formats: "Share: https://...", "URL: https://..."
+        if (preg_match('/(https?:\/\/\S+\?[^\s"\']+)/', $r['output'], $m)) {
+            return ['success' => true, 'url' => $m[1], 'error' => null];
+        }
+        return ['success' => false, 'url' => '', 'error' => 'Could not parse presigned URL from mc output: ' . $r['output']];
     }
 
     /**
@@ -363,10 +371,16 @@ class MinioClient
     {
         $this->ensureAlias();
         $path = $this->mcAlias . '/' . $bucketName . '/' . $objectKey;
-        $r = $this->mc('share upload', [$path, '--expire=' . $expireSeconds . 's'], false);
+        $expire = '--expire=' . $expireSeconds . 's';
+        $r = $this->mc('share upload', [$expire, $path], false);
+        if (!$r['success']) {
+            $r = $this->mc('share upload', [$path, $expire], false);
+        }
         if (!$r['success']) return ['success' => false, 'url' => '', 'error' => $r['output']];
-        preg_match('/(?:curl|URL).*?(https?:\/\/\S+)/', $r['output'], $m);
-        return ['success' => !empty($m[1]), 'url' => $m[1] ?? '', 'error' => empty($m[1]) ? 'Could not parse URL' : null];
+        if (preg_match('/(https?:\/\/\S+\?[^\s"\']+)/', $r['output'], $m)) {
+            return ['success' => true, 'url' => $m[1], 'error' => null];
+        }
+        return ['success' => false, 'url' => '', 'error' => 'Could not parse presigned URL from mc output: ' . $r['output']];
     }
 
     /**
@@ -385,13 +399,17 @@ class MinioClient
     public function createFolder(string $bucketName, string $folderPath): array
     {
         $this->ensureAlias();
-        // mc doesn't have a mkdir; we use pipe to create an empty object
+        // mc doesn't have a mkdir; we use pipe to create an empty object with trailing slash
         $path = $this->mcAlias . '/' . $bucketName . '/' . rtrim($folderPath, '/') . '/';
-        $cmd = 'echo -n "" | ' . escapeshellcmd($this->mcPath) . ' pipe ' . escapeshellarg($path);
+        $mcBin = escapeshellarg($this->mcPath);
+        $target = escapeshellarg($path);
+        $cmd = 'echo -n "" | ' . $mcBin . ' pipe ' . $target;
         $env = 'MC_CONFIG_DIR=/tmp/.mc-impulse HOME=/tmp ';
         $output = []; $exitCode = 0;
         exec($env . $cmd . ' 2>&1', $output, $exitCode);
-        return ['success' => $exitCode === 0, 'output' => implode("\n", $output)];
+        $outputStr = implode("\n", $output);
+        logModuleCall('impulseminio', 'mc: pipe (createFolder)', ['path' => $path], $outputStr, null, [$this->accessKey, $this->secretKey]);
+        return ['success' => $exitCode === 0, 'output' => $outputStr];
     }
 
     // === HELPERS ===
