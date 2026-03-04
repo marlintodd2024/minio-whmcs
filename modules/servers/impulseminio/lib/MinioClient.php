@@ -421,15 +421,13 @@ class MinioClient
     {
         $this->ensureAlias();
         $path = $this->mcAlias . '/' . $bucketName . '/' . rtrim($folderPath, '/') . '/.keep';
-        $mcBin = escapeshellarg($this->mcPath);
-        $target = escapeshellarg($path);
-        $cmd = 'echo -n "" | ' . $mcBin . ' pipe ' . $target;
-        $env = 'MC_CONFIG_DIR=/tmp/.mc-impulse HOME=/tmp ';
-        $output = []; $exitCode = 0;
-        exec($env . $cmd . ' 2>&1', $output, $exitCode);
-        $outputStr = implode("\n", $output);
-        logModuleCall('impulseminio', 'mc: pipe (createFolder)', ['path' => $path], $outputStr, null, [$this->accessKey, $this->secretKey]);
-        return ['success' => $exitCode === 0, 'output' => $outputStr];
+        // Use mc cp from a temp file — mc pipe via PHP exec has stdin issues under web users
+        $tmpFile = tempnam('/tmp', 'minio_folder_');
+        file_put_contents($tmpFile, '.keep');
+        $r = $this->mc('cp', [$tmpFile, $path]);
+        unlink($tmpFile);
+        logModuleCall('impulseminio', 'mc: cp (createFolder)', ['path' => $path], $r['output'], null, [$this->accessKey, $this->secretKey]);
+        return ['success' => $r['success'], 'output' => $r['output']];
     }
 
     // === HELPERS ===
