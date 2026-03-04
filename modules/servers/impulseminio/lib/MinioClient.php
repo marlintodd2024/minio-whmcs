@@ -166,7 +166,17 @@ class MinioClient
     public function deleteBucket(string $bucketName, bool $force = true): array
     {
         $this->ensureAlias();
-        if ($force) $this->mc('rm', ['--recursive', '--force', $this->mcAlias . '/' . $bucketName]);
+        if ($force) {
+            $rmResult = $this->mc('rm', ['--recursive', '--force', $this->mcAlias . '/' . $bucketName]);
+            // Truncate verbose rm output in the log to prevent flooding
+            if (strlen($rmResult['output']) > 500) {
+                $lines = explode("\n", $rmResult['output']);
+                $count = count($lines);
+                $summary = implode("\n", array_slice($lines, 0, 3));
+                $summary .= "\n... and " . ($count - 3) . " more objects removed";
+                logModuleCall($this->logModule, 'mc: rm (truncated)', ['bucket' => $bucketName], $summary, null, [$this->accessKey, $this->secretKey]);
+            }
+        }
         $r = $this->mc('rb', [$this->mcAlias . '/' . $bucketName]);
         return ['success' => $r['success'], 'error' => $r['success'] ? null : $r['output']];
     }
@@ -184,6 +194,34 @@ class MinioClient
         $this->ensureAlias();
         $r = $this->mc('quota clear', [$this->mcAlias . '/' . $bucketName]);
         return ['success' => $r['success'], 'error' => $r['success'] ? null : $r['output']];
+    }
+
+    // === VERSIONING ===
+    public function enableVersioning(string $bucketName): array
+    {
+        $this->ensureAlias();
+        $r = $this->mc('version enable', [$this->mcAlias . '/' . $bucketName]);
+        return ['success' => $r['success'], 'error' => $r['success'] ? null : $r['output']];
+    }
+
+    public function suspendVersioning(string $bucketName): array
+    {
+        $this->ensureAlias();
+        $r = $this->mc('version suspend', [$this->mcAlias . '/' . $bucketName]);
+        return ['success' => $r['success'], 'error' => $r['success'] ? null : $r['output']];
+    }
+
+    public function getVersioningStatus(string $bucketName): string
+    {
+        $this->ensureAlias();
+        $r = $this->mc('version info', [$this->mcAlias . '/' . $bucketName], true);
+        if (!$r['success']) return 'unknown';
+        $data = json_decode($r['output'], true);
+        if ($data && isset($data['status'])) return strtolower($data['status']);
+        // Fallback: parse text output
+        if (strpos($r['output'], 'versioning is enabled') !== false) return 'enabled';
+        if (strpos($r['output'], 'versioning is suspended') !== false) return 'suspended';
+        return 'unversioned';
     }
 
     // === ACCESS KEY (SERVICE ACCOUNT) MANAGEMENT ===
@@ -266,6 +304,94 @@ class MinioClient
             }
         }
         return ['bytesReceived' => $rx, 'bytesSent' => $tx];
+    }
+
+    // === OBJECT OPERATIONS ===
+
+    /**
+     * List objects in a bucket with optional prefix for folder navigation.
+     * Returns array of objects with name, size, lastModified, and type (file/folder).
+     */
+    public function listObjects(string $bucketName, string $prefix = '', bool $recursive = false): array
+    {
+        $this->ensureAlias();
+        $path = $this->mcAlias . '/' . $bucketName;
+        if ($prefix) $path .= '/' . rtrim($prefix, '/') . '/';
+        $args = [$path];
+        if (!$recursive) $args[] = '--incomplete'; // placeholder — mc ls is non-recursive by default
+        $r = $this->mc('ls', [$path], true);
+        if (!$r['success']) return ['success' => false, 'objects' => [], 'error' => $r['output']];
+
+        $objects = [];
+        $lines = array_filter(explode("\n", trim($r['output'])));
+        foreach ($lines as $line) {
+            $data = json_decode($line, true);
+            if (!$data) continue;
+            $key = $data['key'] ?? '';
+            if (empty($key)) continue;
+            $isDir = !empty($data['type']) && $data['type'] === 'folder';
+            // Also detect directories by trailing slash
+            if (substr($key, -1) === '/') $isDir = true;
+            $objects[] = [
+                'key'          => $key,
+                'size'         => (int)($data['size'] ?? 0),
+                'lastModified' => $data['lastModified'] ?? '',
+                'type'         => $isDir ? 'folder' : 'file',
+            ];
+        }
+        return ['success' => true, 'objects' => $objects, 'error' => null];
+    }
+
+    /**
+     * Generate a presigned URL for downloading an object (expires in given seconds).
+     */
+    public function getPresignedDownloadUrl(string $bucketName, string $objectKey, int $expireSeconds = 3600): array
+    {
+        $this->ensureAlias();
+        $path = $this->mcAlias . '/' . $bucketName . '/' . $objectKey;
+        $r = $this->mc('share download', [$path, '--expire=' . $expireSeconds . 's'], false);
+        if (!$r['success']) return ['success' => false, 'url' => '', 'error' => $r['output']];
+        // Extract URL from output — mc outputs: "URL: https://..."
+        preg_match('/(?:Share|URL):\s*(https?:\/\/\S+)/', $r['output'], $m);
+        return ['success' => !empty($m[1]), 'url' => $m[1] ?? '', 'error' => empty($m[1]) ? 'Could not parse URL' : null];
+    }
+
+    /**
+     * Generate a presigned URL for uploading an object (expires in given seconds).
+     */
+    public function getPresignedUploadUrl(string $bucketName, string $objectKey, int $expireSeconds = 3600): array
+    {
+        $this->ensureAlias();
+        $path = $this->mcAlias . '/' . $bucketName . '/' . $objectKey;
+        $r = $this->mc('share upload', [$path, '--expire=' . $expireSeconds . 's'], false);
+        if (!$r['success']) return ['success' => false, 'url' => '', 'error' => $r['output']];
+        preg_match('/(?:curl|URL).*?(https?:\/\/\S+)/', $r['output'], $m);
+        return ['success' => !empty($m[1]), 'url' => $m[1] ?? '', 'error' => empty($m[1]) ? 'Could not parse URL' : null];
+    }
+
+    /**
+     * Delete an object from a bucket.
+     */
+    public function deleteObject(string $bucketName, string $objectKey): array
+    {
+        $this->ensureAlias();
+        $path = $this->mcAlias . '/' . $bucketName . '/' . $objectKey;
+        return $this->mc('rm', [$path]);
+    }
+
+    /**
+     * Create a "folder" (empty object with trailing slash) in a bucket.
+     */
+    public function createFolder(string $bucketName, string $folderPath): array
+    {
+        $this->ensureAlias();
+        // mc doesn't have a mkdir; we use pipe to create an empty object
+        $path = $this->mcAlias . '/' . $bucketName . '/' . rtrim($folderPath, '/') . '/';
+        $cmd = 'echo -n "" | ' . escapeshellcmd($this->mcPath) . ' pipe ' . escapeshellarg($path);
+        $env = 'MC_CONFIG_DIR=/tmp/.mc-impulse HOME=/tmp ';
+        $output = []; $exitCode = 0;
+        exec($env . $cmd . ' 2>&1', $output, $exitCode);
+        return ['success' => $exitCode === 0, 'output' => implode("\n", $output)];
     }
 
     // === HELPERS ===

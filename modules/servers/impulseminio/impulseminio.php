@@ -620,6 +620,7 @@ function impulseminio_renderClientArea(array $params = []): string
         $nk = $_SESSION['impulseminio_new_key'];
         $eak = $esc($nk['accessKey'] ?? '');
         $esk = $esc($nk['secretKey'] ?? '');
+        $ekLabel = $esc($nk['name'] ?? '');
         $newKeyFlash .= '<div class="alert alert-success alert-dismissible" id="newKeyAlert">';
         $newKeyFlash .= '<button type="button" class="close" data-dismiss="alert">&times;</button>';
         $newKeyFlash .= '<h4><i class="fas fa-key"></i> Access Key Created Successfully</h4>';
@@ -627,7 +628,9 @@ function impulseminio_renderClientArea(array $params = []): string
         $newKeyFlash .= '<div class="row" style="margin-top:10px;">';
         $newKeyFlash .= '<div class="col-md-6"><label>Access Key</label><div class="input-group"><input type="text" class="form-control" id="newAccessKey" value="' . $eak . '" readonly><span class="input-group-btn"><button class="btn btn-default" onclick="idCopy(\'newAccessKey\')"><i class="fas fa-copy"></i></button></span></div></div>';
         $newKeyFlash .= '<div class="col-md-6"><label>Secret Key</label><div class="input-group"><input type="text" class="form-control" id="newSecretKey" value="' . $esk . '" readonly><span class="input-group-btn"><button class="btn btn-default" onclick="idCopy(\'newSecretKey\')"><i class="fas fa-copy"></i></button></span></div></div>';
-        $newKeyFlash .= '</div></div>';
+        $newKeyFlash .= '</div>';
+        $newKeyFlash .= '<div style="margin-top:12px;"><button class="btn btn-primary btn-sm" onclick="downloadCredentials(\'' . $eak . '\',\'' . $esk . '\',\'' . $ekLabel . '\')"><i class="fas fa-download"></i> Download Credentials (.txt)</button></div>';
+        $newKeyFlash .= '</div>';
         unset($_SESSION['impulseminio_new_key']);
     }
 
@@ -656,6 +659,7 @@ function impulseminio_renderClientArea(array $params = []): string
     $o .= '<li role="presentation"><a href="#tab-buckets" data-toggle="tab"><i class="fas fa-archive"></i> Buckets <span class="badge">' . $bucketCount . '</span></a></li>';
     $o .= '<li role="presentation"><a href="#tab-keys" data-toggle="tab"><i class="fas fa-key"></i> Access Keys <span class="badge">' . $keyCount . '</span></a></li>';
     $o .= '<li role="presentation"><a href="#tab-quickstart" data-toggle="tab"><i class="fas fa-rocket"></i> Quick Start</a></li>';
+    $o .= '<li role="presentation"><a href="#tab-files" data-toggle="tab"><i class="fas fa-folder-open"></i> File Browser</a></li>';
     $o .= '</ul>';
     $o .= '<div class="tab-content">';
 
@@ -663,25 +667,37 @@ function impulseminio_renderClientArea(array $params = []): string
     $o .= '<div role="tabpanel" class="tab-pane active" id="tab-overview">';
     $o .= $passwordResetFlash;
 
-    // Connection Details
-    $o .= '<div class="panel panel-default"><div class="panel-heading"><h3 class="panel-title"><i class="fas fa-cloud"></i> S3 Connection Details</h3></div>';
+    // Connection Details — clean table layout with plan info
+    $o .= '<div class="panel panel-default"><div class="panel-heading"><h3 class="panel-title"><i class="fas fa-plug"></i> S3 Connection Details</h3></div>';
     $o .= '<div class="panel-body">';
-    $o .= '<p class="text-muted">Use these credentials with any S3-compatible client.</p>';
-    $o .= '<div class="row" style="margin-bottom:15px;">';
-    $o .= '<div class="col-md-6"><label>S3 Endpoint</label><div class="input-group"><input type="text" class="form-control" id="s3endpoint" value="' . $ee . '" readonly><span class="input-group-btn"><button class="btn btn-default" onclick="idCopy(\'s3endpoint\')" title="Copy"><i class="fas fa-copy"></i></button></span></div></div>';
-    $o .= '<div class="col-md-6"><label>Default Bucket</label><div class="input-group"><input type="text" class="form-control" id="bucketname" value="' . $defaultBucket . '" readonly><span class="input-group-btn"><button class="btn btn-default" onclick="idCopy(\'bucketname\')" title="Copy"><i class="fas fa-copy"></i></button></span></div></div>';
+
+    // Plan summary row
+    $mbDisplay = $maxBuckets > 0 ? $maxBuckets : '&infin;';
+    $mkDisplay2 = $maxKeys > 0 ? $maxKeys : '&infin;';
+    $o .= '<div class="row" style="margin-bottom:20px;">';
+    $o .= '<div class="col-xs-6 col-md-3 text-center"><div style="padding:12px;background:#f8f9fa;border-radius:6px;"><div style="font-size:22px;font-weight:700;color:#1a1a2e;">' . $diskLimit . '</div><div class="text-muted" style="font-size:12px;">Storage</div></div></div>';
+    $o .= '<div class="col-xs-6 col-md-3 text-center"><div style="padding:12px;background:#f8f9fa;border-radius:6px;"><div style="font-size:22px;font-weight:700;color:#1a1a2e;">' . $bwLimit . '</div><div class="text-muted" style="font-size:12px;">Bandwidth</div></div></div>';
+    $o .= '<div class="col-xs-6 col-md-3 text-center"><div style="padding:12px;background:#f8f9fa;border-radius:6px;"><div style="font-size:22px;font-weight:700;color:#1a1a2e;">' . $mbDisplay . '</div><div class="text-muted" style="font-size:12px;">Buckets</div></div></div>';
+    $o .= '<div class="col-xs-6 col-md-3 text-center"><div style="padding:12px;background:#f8f9fa;border-radius:6px;"><div style="font-size:22px;font-weight:700;color:#1a1a2e;">' . $mkDisplay2 . '</div><div class="text-muted" style="font-size:12px;">Access Keys</div></div></div>';
     $o .= '</div>';
-    $o .= '<div class="row" style="margin-bottom:15px;">';
-    $o .= '<div class="col-md-6"><label>Access Key (Username)</label><div class="input-group"><input type="text" class="form-control" id="accesskey" value="' . $eu . '" readonly><span class="input-group-btn"><button class="btn btn-default" onclick="idCopy(\'accesskey\')" title="Copy"><i class="fas fa-copy"></i></button></span></div></div>';
-    $o .= '<div class="col-md-6"><label>Secret Key (Password)</label><div class="input-group"><input type="password" class="form-control" id="secretkey" value="' . $ep . '" readonly><span class="input-group-btn"><button class="btn btn-outline-secondary btn-default" onclick="togglePw(\'secretkey\')" title="Show/Hide"><i class="fas fa-eye" id="secretkey-eye"></i></button><button class="btn btn-default" onclick="idCopy(\'secretkey\')" title="Copy"><i class="fas fa-copy"></i></button></span></div></div>';
-    $o .= '</div>';
-    $o .= '<div class="row"><div class="col-md-6"><label>Region</label><input type="text" class="form-control" value="us-east-1" readonly></div>';
-    $o .= '<div class="col-md-6"><label>&nbsp;</label><div>';
+
+    // Credentials table
+    $o .= '<table class="table table-condensed" style="margin-bottom:15px;">';
+    $o .= '<tbody>';
+    $o .= '<tr><td style="width:160px;font-weight:600;vertical-align:middle;padding:10px;">S3 Endpoint</td><td><div class="input-group"><input type="text" class="form-control input-sm" id="s3endpoint" value="' . $ee . '" readonly style="font-family:monospace;"><span class="input-group-btn"><button class="btn btn-default btn-sm" onclick="idCopy(\'s3endpoint\')" title="Copy"><i class="fas fa-copy"></i></button></span></div></td></tr>';
+    $o .= '<tr><td style="font-weight:600;vertical-align:middle;padding:10px;">Region</td><td><input type="text" class="form-control input-sm" value="us-east-1" readonly style="font-family:monospace;max-width:200px;"></td></tr>';
+    $o .= '<tr><td style="font-weight:600;vertical-align:middle;padding:10px;">Access Key</td><td><div class="input-group"><input type="text" class="form-control input-sm" id="accesskey" value="' . $eu . '" readonly style="font-family:monospace;"><span class="input-group-btn"><button class="btn btn-default btn-sm" onclick="idCopy(\'accesskey\')" title="Copy"><i class="fas fa-copy"></i></button></span></div></td></tr>';
+    $o .= '<tr><td style="font-weight:600;vertical-align:middle;padding:10px;">Secret Key</td><td><div class="input-group"><input type="password" class="form-control input-sm" id="secretkey" value="' . $ep . '" readonly style="font-family:monospace;"><span class="input-group-btn"><button class="btn btn-default btn-sm" onclick="togglePw(\'secretkey\')" title="Show/Hide"><i class="fas fa-eye" id="secretkey-eye"></i></button><button class="btn btn-default btn-sm" onclick="idCopy(\'secretkey\')" title="Copy"><i class="fas fa-copy"></i></button></span></div></td></tr>';
+    $o .= '<tr><td style="font-weight:600;vertical-align:middle;padding:10px;">Default Bucket</td><td><div class="input-group"><input type="text" class="form-control input-sm" id="bucketname" value="' . $defaultBucket . '" readonly style="font-family:monospace;"><span class="input-group-btn"><button class="btn btn-default btn-sm" onclick="idCopy(\'bucketname\')" title="Copy"><i class="fas fa-copy"></i></button></span></div></td></tr>';
+    $o .= '</tbody></table>';
+
+    // Action buttons
+    $o .= '<div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center;">';
     if ($consoleUrl) {
-        $o .= '<a href="' . $ec . '" target="_blank" class="btn btn-primary" style="margin-right:8px;"><i class="fas fa-external-link-alt"></i> Open Storage Console</a>';
+        $o .= '<a href="' . $ec . '" target="_blank" class="btn btn-primary btn-sm"><i class="fas fa-external-link-alt"></i> Open Console</a>';
     }
-    $o .= '<button class="btn btn-warning" onclick="resetPassword()" title="Generate a new secret key"><i class="fas fa-sync-alt"></i> Reset Secret Key</button>';
-    $o .= '</div></div>';
+    $o .= '<button class="btn btn-warning btn-sm" onclick="resetPassword()"><i class="fas fa-sync-alt"></i> Reset Secret Key</button>';
+    $o .= '<button class="btn btn-default btn-sm" onclick="copyAllCreds()" title="Copy all connection details to clipboard"><i class="fas fa-clipboard-list"></i> Copy All</button>';
     $o .= '</div>';
     $o .= '</div></div>';
 
@@ -789,6 +805,44 @@ function impulseminio_renderClientArea(array $params = []): string
 
     $o .= '</div></div></div>';
 
+    // === FILE BROWSER TAB ===
+    $o .= '<div role="tabpanel" class="tab-pane" id="tab-files">';
+    $o .= '<div class="panel panel-default"><div class="panel-heading"><h3 class="panel-title"><i class="fas fa-folder-open"></i> Object Explorer</h3></div>';
+    $o .= '<div class="panel-body">';
+
+    // Toolbar: bucket select + breadcrumb + actions
+    $o .= '<div class="fb-toolbar" style="display:flex;align-items:center;gap:10px;margin-bottom:15px;flex-wrap:wrap;">';
+    $o .= '<select id="fb-bucket" class="form-control input-sm" style="width:auto;min-width:180px;" onchange="fbNavigate(this.value,\'\')">';
+    foreach ($buckets as $b) {
+        $sel = ($b->bucket_name === ($buckets[0]->bucket_name ?? '')) ? ' selected' : '';
+        $o .= '<option value="' . $esc($b->bucket_name) . '"' . $sel . '>' . $esc($b->label ?: $b->bucket_name) . '</option>';
+    }
+    $o .= '</select>';
+    $o .= '<nav id="fb-breadcrumb" style="flex:1;font-size:13px;"><a href="#" onclick="fbNavigate(null,\'\');return false;" style="font-weight:600;"><i class="fas fa-home"></i></a></nav>';
+    $o .= '<button class="btn btn-success btn-sm" onclick="fbShowUpload()" title="Upload files"><i class="fas fa-upload"></i> Upload</button>';
+    $o .= '<button class="btn btn-default btn-sm" onclick="fbCreateFolder()" title="New folder"><i class="fas fa-folder-plus"></i> New Folder</button>';
+    $o .= '<button class="btn btn-default btn-sm" onclick="fbRefresh()" title="Refresh"><i class="fas fa-sync-alt"></i></button>';
+    $o .= '</div>';
+
+    // Upload drop zone (hidden by default)
+    $o .= '<div id="fb-upload-zone" style="display:none;margin-bottom:15px;padding:30px;border:2px dashed #ccc;border-radius:8px;text-align:center;background:#fafafa;cursor:pointer;" onclick="document.getElementById(\'fb-upload-input\').click()" ondrop="fbHandleDrop(event)" ondragover="event.preventDefault();this.style.borderColor=\'#1a1a2e\';this.style.background=\'#f0f0ff\'" ondragleave="this.style.borderColor=\'#ccc\';this.style.background=\'#fafafa\'">';
+    $o .= '<i class="fas fa-cloud-upload-alt" style="font-size:32px;color:#999;margin-bottom:8px;display:block;"></i>';
+    $o .= '<p style="margin:0;color:#666;">Drag and drop files here, or click to select</p>';
+    $o .= '<input type="file" id="fb-upload-input" multiple style="display:none;" onchange="fbUploadFiles(this.files)">';
+    $o .= '<div id="fb-upload-progress" style="margin-top:10px;"></div>';
+    $o .= '</div>';
+
+    // File listing table
+    $o .= '<div id="fb-loading" style="display:none;text-align:center;padding:30px;"><i class="fas fa-spinner fa-spin fa-2x" style="color:#999;"></i></div>';
+    $o .= '<table class="table table-hover table-condensed" id="fb-table" style="margin-bottom:0;">';
+    $o .= '<thead><tr><th style="width:30px;"></th><th>Name</th><th style="width:100px;">Size</th><th style="width:170px;">Last Modified</th><th style="width:80px;"></th></tr></thead>';
+    $o .= '<tbody id="fb-body"><tr><td colspan="5" class="text-center text-muted" style="padding:30px;">Select a bucket to browse files</td></tr></tbody>';
+    $o .= '</table>';
+
+    $o .= '<div id="fb-empty" style="display:none;text-align:center;padding:30px;color:#999;"><i class="fas fa-inbox" style="font-size:32px;display:block;margin-bottom:8px;"></i>This folder is empty</div>';
+
+    $o .= '</div></div></div>';
+
     $o .= '</div>'; // tab-content
     $o .= '</div>'; // impulsedrive-dashboard
 
@@ -800,10 +854,44 @@ function impulseminio_renderClientArea(array $params = []): string
     $o .= 'function deleteKey(k){if(!confirm("Revoke access key \\""+k+"\\"?")){return;}var f=document.createElement("form");f.method="post";f.action="clientarea.php?action=productdetails&id=' . $serviceId . '#accesskeys";f.innerHTML=\'<input type="hidden" name="token" value="\'+ csrfToken+\'"><input type="hidden" name="modop" value="custom"><input type="hidden" name="a" value="clientDeleteAccessKey"><input type="hidden" name="id" value="' . $serviceId . '"><input type="hidden" name="access_key_id" value="\'+k+\'">\';document.body.appendChild(f);f.submit();}';
     $o .= 'function toggleVersioning(n){var msg=confirm("Toggle versioning on bucket \\""+n+"\\"?")?true:false;if(!msg)return;var f=document.createElement("form");f.method="post";f.action="clientarea.php?action=productdetails&id=' . $serviceId . '#buckets";f.innerHTML=\'<input type="hidden" name="token" value="\'+ csrfToken+\'"><input type="hidden" name="modop" value="custom"><input type="hidden" name="a" value="clientToggleVersioning"><input type="hidden" name="id" value="' . $serviceId . '"><input type="hidden" name="bucket_name" value="\'+n+\'">\';document.body.appendChild(f);f.submit();}';
     $o .= 'function resetPassword(){if(!confirm("Reset your secret key? Your current key will stop working immediately. You will need to update all applications using the current key.")){return;}var f=document.createElement("form");f.method="post";f.action="clientarea.php?action=productdetails&id=' . $serviceId . '#overview";f.innerHTML=\'<input type="hidden" name="token" value="\'+ csrfToken+\'"><input type="hidden" name="modop" value="custom"><input type="hidden" name="a" value="clientResetPassword"><input type="hidden" name="id" value="' . $serviceId . '">\';document.body.appendChild(f);f.submit();}';
+    // Copy All credentials to clipboard
+    $o .= 'function copyAllCreds(){var t="S3 Endpoint: "+document.getElementById("s3endpoint").value+"\\nRegion: us-east-1\\nAccess Key: "+document.getElementById("accesskey").value+"\\nSecret Key: "+document.getElementById("secretkey").value+"\\nDefault Bucket: "+document.getElementById("bucketname").value;navigator.clipboard?navigator.clipboard.writeText(t).then(function(){alert("Connection details copied to clipboard.")}):alert("Could not copy — use individual copy buttons instead.");}';
+    // Download credentials as .txt file with full connection info
+    $o .= 'function downloadCredentials(ak,sk,label){var lines=[];lines.push("================================================");lines.push("  ImpulseDrive — S3 Access Key Credentials");lines.push("================================================");lines.push("");lines.push("Created:      "+new Date().toISOString());if(label)lines.push("Label:        "+label);lines.push("");lines.push("--- Connection Details ---");lines.push("S3 Endpoint:  "+document.getElementById("s3endpoint").value);lines.push("Region:       us-east-1");lines.push("Access Key:   "+ak);lines.push("Secret Key:   "+sk);lines.push("");lines.push("--- Default Bucket ---");lines.push("Bucket:       "+document.getElementById("bucketname").value);lines.push("");lines.push("--- AWS CLI Quick Start ---");lines.push("aws configure set aws_access_key_id "+ak);lines.push("aws configure set aws_secret_access_key "+sk);lines.push("aws --endpoint-url "+document.getElementById("s3endpoint").value+" s3 ls");lines.push("");lines.push("--- rclone Config ---");lines.push("[impulsedrive]");lines.push("type = s3");lines.push("provider = Minio");lines.push("access_key_id = "+ak);lines.push("secret_access_key = "+sk);lines.push("endpoint = "+document.getElementById("s3endpoint").value);lines.push("acl = private");lines.push("");lines.push("--- boto3 (Python) ---");lines.push("import boto3");lines.push("s3 = boto3.client(\\\"s3\\\",");lines.push("    endpoint_url=\\\""+document.getElementById("s3endpoint").value+"\\\",");lines.push("    aws_access_key_id=\\\""+ak+"\\\",");lines.push("    aws_secret_access_key=\\\""+sk+"\\\",");lines.push("    region_name=\\\"us-east-1\\\"");lines.push(")");lines.push("");lines.push("================================================");lines.push("  KEEP THIS FILE SECURE — DO NOT SHARE");lines.push("  The secret key cannot be recovered if lost.");lines.push("================================================");var blob=new Blob([lines.join("\\n")],{type:"text/plain"});var url=URL.createObjectURL(blob);var a=document.createElement("a");a.href=url;a.download="impulsedrive-credentials-"+ak.substring(0,8)+".txt";document.body.appendChild(a);a.click();document.body.removeChild(a);URL.revokeObjectURL(url);}';
+    // File Browser JS
+    $o .= 'var fbServiceId=' . $serviceId . ',fbCurrentBucket="' . $defaultBucket . '",fbCurrentPrefix="",fbCsrf=csrfToken;';
+    $o .= 'function fbAjax(action,data,cb){data.modop="custom";data.a=action;data.id=fbServiceId;data.token=fbCsrf;var x=new XMLHttpRequest();x.open("POST","clientarea.php?action=productdetails&id="+fbServiceId,true);x.setRequestHeader("Content-Type","application/x-www-form-urlencoded");x.setRequestHeader("X-Requested-With","XMLHttpRequest");x.onload=function(){try{cb(JSON.parse(x.responseText));}catch(e){cb({success:false,error:"Invalid response"});}};x.onerror=function(){cb({success:false,error:"Network error"});};var q=[];for(var k in data)q.push(encodeURIComponent(k)+"="+encodeURIComponent(data[k]));x.send(q.join("&"));}';
+
+    $o .= 'function fbNavigate(bucket,prefix){if(bucket!==null)fbCurrentBucket=bucket;fbCurrentPrefix=prefix||"";fbRefresh();}';
+
+    $o .= 'function fbRefresh(){var body=document.getElementById("fb-body"),loading=document.getElementById("fb-loading"),empty=document.getElementById("fb-empty"),tbl=document.getElementById("fb-table");body.innerHTML="";loading.style.display="block";tbl.style.display="none";empty.style.display="none";fbUpdateBreadcrumb();fbAjax("clientListObjects",{bucket_name:fbCurrentBucket,prefix:fbCurrentPrefix},function(r){loading.style.display="none";if(!r.success){body.innerHTML=\'<tr><td colspan="5" class="text-center text-danger">\'+r.error+\'</td></tr>\';tbl.style.display="table";return;}if(!r.objects||r.objects.length===0){empty.style.display="block";tbl.style.display="none";return;}tbl.style.display="table";r.objects.forEach(function(obj){var tr=document.createElement("tr");if(obj.type==="folder"){tr.innerHTML=\'<td><i class="fas fa-folder" style="color:#f0c040;font-size:16px;"></i></td><td><a href="#" onclick="fbNavigate(null,\\\'\'+obj.key+\'\\\');return false;" style="font-weight:500;">\'+fbDisplayName(obj.key)+\'</a></td><td class="text-muted">&mdash;</td><td class="text-muted">&mdash;</td><td><button class="btn btn-xs btn-danger" onclick="fbDeleteObject(\\\'\'+obj.key+\'\\\',true)" title="Delete folder"><i class="fas fa-trash"></i></button></td>\';}else{tr.innerHTML=\'<td><i class="fas fa-file" style="color:#5c7cfa;font-size:16px;"></i></td><td>\'+fbDisplayName(obj.key)+\'</td><td class="text-muted">\'+fbFormatSize(obj.size)+\'</td><td class="text-muted">\'+fbFormatDate(obj.lastModified)+\'</td><td style="white-space:nowrap;"><button class="btn btn-xs btn-primary" onclick="fbDownload(\\\'\'+obj.key+\'\\\')" title="Download"><i class="fas fa-download"></i></button> <button class="btn btn-xs btn-danger" onclick="fbDeleteObject(\\\'\'+obj.key+\'\\\',false)" title="Delete"><i class="fas fa-trash"></i></button></td>\';}body.appendChild(tr);});});}';
+
+    $o .= 'function fbDisplayName(key){var parts=key.replace(fbCurrentPrefix,"").split("/");return parts.filter(function(p){return p.length>0;})[0]||key;}';
+
+    $o .= 'function fbFormatSize(b){if(b===0)return"0 B";var u=["B","KB","MB","GB","TB"];var i=Math.floor(Math.log(b)/Math.log(1024));return(b/Math.pow(1024,i)).toFixed(i>0?1:0)+" "+u[i];}';
+
+    $o .= 'function fbFormatDate(d){if(!d)return"";try{var dt=new Date(d);return dt.toLocaleDateString()+" "+dt.toLocaleTimeString([],{hour:"2-digit",minute:"2-digit"});}catch(e){return d;}}';
+
+    $o .= 'function fbUpdateBreadcrumb(){var nav=document.getElementById("fb-breadcrumb");var html=\'<a href="#" onclick="fbNavigate(null,\\\'\\\');return false;" style="font-weight:600;"><i class="fas fa-home"></i> \'+fbCurrentBucket+\'</a>\';if(fbCurrentPrefix){var parts=fbCurrentPrefix.split("/").filter(function(p){return p.length>0;});var path="";parts.forEach(function(p){path+=p+"/";html+=\' <i class="fas fa-chevron-right" style="font-size:10px;color:#999;margin:0 4px;"></i> <a href="#" onclick="fbNavigate(null,\\\'\'+path+\'\\\');return false;">\'+p+\'</a>\';});}nav.innerHTML=html;}';
+
+    $o .= 'function fbDownload(key){fbAjax("clientDownloadObject",{bucket_name:fbCurrentBucket,object_key:key},function(r){if(r.success&&r.url){window.open(r.url,"_blank");}else{alert("Download failed: "+(r.error||"Unknown error"));}});}';
+
+    $o .= 'function fbDeleteObject(key,isFolder){var msg=isFolder?"Delete folder \\""+fbDisplayName(key)+"\\" and all contents?":"Delete \\""+fbDisplayName(key)+"\\"?";if(!confirm(msg))return;fbAjax("clientDeleteObject",{bucket_name:fbCurrentBucket,object_key:key},function(r){if(r.success){fbRefresh();}else{alert("Delete failed: "+(r.error||"Unknown error"));}});}';
+
+    $o .= 'function fbCreateFolder(){var name=prompt("Enter folder name:");if(!name)return;name=name.replace(/[^a-zA-Z0-9._-]/g,"-").replace(/^-+|-+$/g,"");if(!name){alert("Invalid folder name.");return;}var path=fbCurrentPrefix+name+"/";fbAjax("clientCreateFolder",{bucket_name:fbCurrentBucket,folder_path:path},function(r){if(r.success){fbRefresh();}else{alert("Failed: "+(r.error||"Unknown error"));}});}';
+
+    $o .= 'function fbShowUpload(){var z=document.getElementById("fb-upload-zone");z.style.display=z.style.display==="none"?"block":"none";}';
+
+    $o .= 'function fbHandleDrop(e){e.preventDefault();e.currentTarget.style.borderColor="#ccc";e.currentTarget.style.background="#fafafa";if(e.dataTransfer.files.length>0)fbUploadFiles(e.dataTransfer.files);}';
+
+    $o .= 'function fbUploadFiles(files){var prog=document.getElementById("fb-upload-progress");var total=files.length,done=0,failed=0;prog.innerHTML=\'<div class="progress" style="height:20px;"><div class="progress-bar progress-bar-striped active" style="width:0%;">0/\'+total+\'</div></div>\';for(var i=0;i<total;i++){(function(file){var objectKey=fbCurrentPrefix+file.name;fbAjax("clientGetUploadUrl",{bucket_name:fbCurrentBucket,object_key:objectKey},function(r){if(!r.success||!r.url){failed++;checkDone();return;}var xhr=new XMLHttpRequest();xhr.open("PUT",r.url,true);xhr.setRequestHeader("Content-Type",file.type||"application/octet-stream");xhr.onload=function(){if(xhr.status>=200&&xhr.status<300)done++;else failed++;checkDone();};xhr.onerror=function(){failed++;checkDone();};xhr.send(file);});})(files[i]);}function checkDone(){var pct=Math.round(((done+failed)/total)*100);prog.querySelector(".progress-bar").style.width=pct+"%";prog.querySelector(".progress-bar").textContent=(done+failed)+"/"+total;if(done+failed>=total){setTimeout(function(){prog.innerHTML=\'<p class="text-success"><i class="fas fa-check"></i> \'+done+\' uploaded\'+( failed?\', <span class="text-danger">\'+failed+\' failed</span>\':\'\')+\'</p>\';document.getElementById("fb-upload-zone").style.display="none";fbRefresh();},500);}}}';
+
+    // Auto-load files when switching to file browser tab
+    $o .= 'document.querySelectorAll(".nav-tabs a[href=\'#tab-files\']").forEach(function(a){a.addEventListener("click",function(){setTimeout(function(){if(document.getElementById("fb-body").children.length<=1)fbRefresh();},100);});});';
     // Fix 8: Activate correct tab from URL hash on page load
-    $o .= '(function(){var h=window.location.hash;if(h){var map={"#buckets":"#tab-buckets","#accesskeys":"#tab-keys","#quickstart":"#tab-quickstart","#overview":"#tab-overview"};var target=map[h]||h;var tabLink=document.querySelector(\'.nav-tabs a[href="\'+target+\'"]\');if(tabLink){var evt=document.createEvent("HTMLEvents");evt.initEvent("click",true,true);tabLink.dispatchEvent(evt);if(typeof jQuery!=="undefined"){jQuery(tabLink).tab("show");}else{document.querySelectorAll(".nav-tabs li").forEach(function(li){li.classList.remove("active");});tabLink.parentElement.classList.add("active");document.querySelectorAll(".tab-pane").forEach(function(p){p.classList.remove("active");});var pane=document.querySelector(target);if(pane)pane.classList.add("active");}}}';
+    $o .= '(function(){var h=window.location.hash;if(h){var map={"#buckets":"#tab-buckets","#accesskeys":"#tab-keys","#quickstart":"#tab-quickstart","#overview":"#tab-overview","#files":"#tab-files"};var target=map[h]||h;var tabLink=document.querySelector(\'.nav-tabs a[href="\'+target+\'"]\');if(tabLink){var evt=document.createEvent("HTMLEvents");evt.initEvent("click",true,true);tabLink.dispatchEvent(evt);if(typeof jQuery!=="undefined"){jQuery(tabLink).tab("show");}else{document.querySelectorAll(".nav-tabs li").forEach(function(li){li.classList.remove("active");});tabLink.parentElement.classList.add("active");document.querySelectorAll(".tab-pane").forEach(function(p){p.classList.remove("active");});var pane=document.querySelector(target);if(pane)pane.classList.add("active");}}}';
     // Fix 8: Handle tab clicks to update active indicator and URL hash
-    $o .= 'document.querySelectorAll(".nav-tabs a[data-toggle=tab]").forEach(function(a){a.addEventListener("click",function(){document.querySelectorAll(".nav-tabs li").forEach(function(li){li.classList.remove("active");});this.parentElement.classList.add("active");var revMap={"#tab-overview":"#overview","#tab-buckets":"#buckets","#tab-keys":"#accesskeys","#tab-quickstart":"#quickstart"};var frag=revMap[this.getAttribute("href")]||this.getAttribute("href");history.replaceState(null,null,frag);});});})()';    $o .= '</script>';
+    $o .= 'document.querySelectorAll(".nav-tabs a[data-toggle=tab]").forEach(function(a){a.addEventListener("click",function(){document.querySelectorAll(".nav-tabs li").forEach(function(li){li.classList.remove("active");});this.parentElement.classList.add("active");var revMap={"#tab-overview":"#overview","#tab-buckets":"#buckets","#tab-keys":"#accesskeys","#tab-quickstart":"#quickstart","#tab-files":"#files"};var frag=revMap[this.getAttribute("href")]||this.getAttribute("href");history.replaceState(null,null,frag);});});})()';    $o .= '</script>';
 
     // CSS
     $o .= '<style>';
@@ -821,10 +909,16 @@ function impulseminio_renderClientArea(array $params = []): string
     $o .= '#newKeyAlert input.form-control{font-family:monospace;font-size:13px;background:#fff}';
     $o .= '.impulsedrive-dashboard .btn-outline-secondary{background:transparent;border-color:#6c757d;color:#6c757d}';
     $o .= '.impulsedrive-dashboard .btn-outline-secondary:hover{background:#6c757d;color:#fff}';
+    // File browser styles
+    $o .= '#fb-table tbody tr:hover{background:#f8f9fa;cursor:default}';
+    $o .= '#fb-table tbody tr td{vertical-align:middle;padding:8px}';
+    $o .= '#fb-breadcrumb a{color:#1a1a2e;text-decoration:none}#fb-breadcrumb a:hover{text-decoration:underline}';
+    $o .= '#fb-upload-zone.drag-over{border-color:#1a1a2e !important;background:#f0f0ff !important}';
+    $o .= '.fb-toolbar .btn{white-space:nowrap}';
     $o .= '</style>';
     // Fix 5: Clear flash messages when switching tabs
     $o .= '<script>document.addEventListener("DOMContentLoaded",function(){document.querySelectorAll(".nav-tabs a[data-toggle=tab]").forEach(function(a){a.addEventListener("click",function(){document.querySelectorAll(".impulsedrive-dashboard > .alert").forEach(function(el){el.style.display="none";});});});';
-    $o .= 'document.querySelectorAll("a").forEach(function(a){var t=a.textContent.trim();if(t=="Create Bucket"||t=="Delete Bucket"||t=="Create Access Key"||t=="Delete Access Key"||t=="Toggle Versioning"||t=="Reset Password"){a.style.display="none";}});});</script>';
+    $o .= 'document.querySelectorAll("a").forEach(function(a){var t=a.textContent.trim();if(t=="Create Bucket"||t=="Delete Bucket"||t=="Create Access Key"||t=="Delete Access Key"||t=="Toggle Versioning"||t=="Reset Password"||t=="List Objects"||t=="Download Object"||t=="Delete Object"||t=="Create Folder"||t=="Get Upload URL"){a.style.display="none";}});});</script>';
 
     return $o;
 }
@@ -846,6 +940,11 @@ function impulseminio_ClientAreaCustomButtonArray(): array
         'Delete Access Key' => 'clientDeleteAccessKey',
         'Toggle Versioning' => 'clientToggleVersioning',
         'Reset Password' => 'clientResetPassword',
+        'List Objects' => 'clientListObjects',
+        'Download Object' => 'clientDownloadObject',
+        'Delete Object' => 'clientDeleteObject',
+        'Create Folder' => 'clientCreateFolder',
+        'Get Upload URL' => 'clientGetUploadUrl',
     ];
 }
 
@@ -1141,6 +1240,189 @@ function impulseminio_clientResetPassword(array $params): string
     } catch (\Exception $e) {
         logModuleCall('impulseminio', __FUNCTION__, $params, $e->getMessage(), $e->getTraceAsString());
         return 'Error: ' . $e->getMessage();
+    }
+}
+
+// =============================================================================
+// FILE BROWSER AJAX HANDLERS
+// =============================================================================
+
+/**
+ * Helper: send JSON response for AJAX calls and exit.
+ * Only sends JSON if the request is XHR; otherwise returns 'success' for
+ * standard WHMCS form submission compatibility.
+ */
+function impulseminio_jsonResponse(array $data): string
+{
+    if (!empty($_SERVER['HTTP_X_REQUESTED_WITH']) &&
+        strtolower($_SERVER['HTTP_X_REQUESTED_WITH']) === 'xmlhttprequest') {
+        header('Content-Type: application/json');
+        echo json_encode($data);
+        exit;
+    }
+    return $data['success'] ? 'success' : ($data['error'] ?? 'Error');
+}
+
+/**
+ * Client AJAX: list objects in a bucket, optionally at a prefix.
+ */
+function impulseminio_clientListObjects(array $params): string
+{
+    try {
+        $serviceId = (int)$params['serviceid'];
+        $bucketName = isset($_POST['bucket_name']) ? trim($_POST['bucket_name']) : '';
+        $prefix = isset($_POST['prefix']) ? trim($_POST['prefix']) : '';
+
+        if (empty($bucketName)) return impulseminio_jsonResponse(['success' => false, 'error' => 'No bucket specified.']);
+
+        // Verify bucket ownership
+        impulseminio_ensureTables();
+        $bucket = Capsule::table('mod_impulseminio_buckets')
+            ->where('service_id', $serviceId)->where('bucket_name', $bucketName)->first();
+        if (!$bucket) return impulseminio_jsonResponse(['success' => false, 'error' => 'Bucket not found.']);
+
+        $client = impulseminio_getClient($params);
+        $r = $client->listObjects($bucketName, $prefix);
+
+        return impulseminio_jsonResponse([
+            'success' => $r['success'],
+            'objects' => $r['objects'] ?? [],
+            'error'   => $r['error'] ?? null,
+        ]);
+    } catch (\Exception $e) {
+        logModuleCall('impulseminio', __FUNCTION__, $params, $e->getMessage(), $e->getTraceAsString());
+        return impulseminio_jsonResponse(['success' => false, 'error' => 'Error: ' . $e->getMessage()]);
+    }
+}
+
+/**
+ * Client AJAX: generate a presigned download URL for an object.
+ */
+function impulseminio_clientDownloadObject(array $params): string
+{
+    try {
+        $serviceId = (int)$params['serviceid'];
+        $bucketName = isset($_POST['bucket_name']) ? trim($_POST['bucket_name']) : '';
+        $objectKey = isset($_POST['object_key']) ? trim($_POST['object_key']) : '';
+
+        if (empty($bucketName) || empty($objectKey))
+            return impulseminio_jsonResponse(['success' => false, 'error' => 'Missing bucket or object key.']);
+
+        impulseminio_ensureTables();
+        $bucket = Capsule::table('mod_impulseminio_buckets')
+            ->where('service_id', $serviceId)->where('bucket_name', $bucketName)->first();
+        if (!$bucket) return impulseminio_jsonResponse(['success' => false, 'error' => 'Bucket not found.']);
+
+        $client = impulseminio_getClient($params);
+        $r = $client->getPresignedDownloadUrl($bucketName, $objectKey, 3600);
+
+        return impulseminio_jsonResponse([
+            'success' => $r['success'],
+            'url'     => $r['url'] ?? '',
+            'error'   => $r['error'] ?? null,
+        ]);
+    } catch (\Exception $e) {
+        logModuleCall('impulseminio', __FUNCTION__, $params, $e->getMessage(), $e->getTraceAsString());
+        return impulseminio_jsonResponse(['success' => false, 'error' => 'Error: ' . $e->getMessage()]);
+    }
+}
+
+/**
+ * Client AJAX: generate a presigned upload URL for an object.
+ * The client-side JS will PUT the file directly to this URL.
+ */
+function impulseminio_clientGetUploadUrl(array $params): string
+{
+    try {
+        $serviceId = (int)$params['serviceid'];
+        $bucketName = isset($_POST['bucket_name']) ? trim($_POST['bucket_name']) : '';
+        $objectKey = isset($_POST['object_key']) ? trim($_POST['object_key']) : '';
+
+        if (empty($bucketName) || empty($objectKey))
+            return impulseminio_jsonResponse(['success' => false, 'error' => 'Missing bucket or object key.']);
+
+        impulseminio_ensureTables();
+        $bucket = Capsule::table('mod_impulseminio_buckets')
+            ->where('service_id', $serviceId)->where('bucket_name', $bucketName)->first();
+        if (!$bucket) return impulseminio_jsonResponse(['success' => false, 'error' => 'Bucket not found.']);
+
+        $client = impulseminio_getClient($params);
+        $r = $client->getPresignedUploadUrl($bucketName, $objectKey, 3600);
+
+        return impulseminio_jsonResponse([
+            'success' => $r['success'],
+            'url'     => $r['url'] ?? '',
+            'error'   => $r['error'] ?? null,
+        ]);
+    } catch (\Exception $e) {
+        logModuleCall('impulseminio', __FUNCTION__, $params, $e->getMessage(), $e->getTraceAsString());
+        return impulseminio_jsonResponse(['success' => false, 'error' => 'Error: ' . $e->getMessage()]);
+    }
+}
+
+/**
+ * Client AJAX: delete an object from a bucket.
+ */
+function impulseminio_clientDeleteObject(array $params): string
+{
+    try {
+        $serviceId = (int)$params['serviceid'];
+        $bucketName = isset($_POST['bucket_name']) ? trim($_POST['bucket_name']) : '';
+        $objectKey = isset($_POST['object_key']) ? trim($_POST['object_key']) : '';
+
+        if (empty($bucketName) || empty($objectKey))
+            return impulseminio_jsonResponse(['success' => false, 'error' => 'Missing bucket or object key.']);
+
+        impulseminio_ensureTables();
+        $bucket = Capsule::table('mod_impulseminio_buckets')
+            ->where('service_id', $serviceId)->where('bucket_name', $bucketName)->first();
+        if (!$bucket) return impulseminio_jsonResponse(['success' => false, 'error' => 'Bucket not found.']);
+
+        $client = impulseminio_getClient($params);
+        $r = $client->deleteObject($bucketName, $objectKey);
+
+        return impulseminio_jsonResponse([
+            'success' => $r['success'],
+            'error'   => $r['success'] ? null : ($r['output'] ?? 'Delete failed'),
+        ]);
+    } catch (\Exception $e) {
+        logModuleCall('impulseminio', __FUNCTION__, $params, $e->getMessage(), $e->getTraceAsString());
+        return impulseminio_jsonResponse(['success' => false, 'error' => 'Error: ' . $e->getMessage()]);
+    }
+}
+
+/**
+ * Client AJAX: create a folder (empty object with trailing /) in a bucket.
+ */
+function impulseminio_clientCreateFolder(array $params): string
+{
+    try {
+        $serviceId = (int)$params['serviceid'];
+        $bucketName = isset($_POST['bucket_name']) ? trim($_POST['bucket_name']) : '';
+        $folderPath = isset($_POST['folder_path']) ? trim($_POST['folder_path']) : '';
+
+        if (empty($bucketName) || empty($folderPath))
+            return impulseminio_jsonResponse(['success' => false, 'error' => 'Missing bucket or folder path.']);
+
+        // Sanitize folder path — allow alphanumeric, dashes, dots, underscores, slashes
+        if (!preg_match('/^[a-zA-Z0-9._\/-]+\/$/', $folderPath))
+            return impulseminio_jsonResponse(['success' => false, 'error' => 'Invalid folder name.']);
+
+        impulseminio_ensureTables();
+        $bucket = Capsule::table('mod_impulseminio_buckets')
+            ->where('service_id', $serviceId)->where('bucket_name', $bucketName)->first();
+        if (!$bucket) return impulseminio_jsonResponse(['success' => false, 'error' => 'Bucket not found.']);
+
+        $client = impulseminio_getClient($params);
+        $r = $client->createFolder($bucketName, $folderPath);
+
+        return impulseminio_jsonResponse([
+            'success' => $r['success'],
+            'error'   => $r['success'] ? null : ($r['output'] ?? 'Create folder failed'),
+        ]);
+    } catch (\Exception $e) {
+        logModuleCall('impulseminio', __FUNCTION__, $params, $e->getMessage(), $e->getTraceAsString());
+        return impulseminio_jsonResponse(['success' => false, 'error' => 'Error: ' . $e->getMessage()]);
     }
 }
 

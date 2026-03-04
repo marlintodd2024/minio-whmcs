@@ -1,19 +1,18 @@
-                    GNU GENERAL PUBLIC LICENSE
-                       Version 3, 29 June 2007
+ImpulseMinio WHMCS Module — Proprietary License
 
- Copyright (C) 2026 Impulse Hosting
+Copyright (c) 2026 Impulse Hosting. All rights reserved.
 
- This program is free software: you can redistribute it and/or modify
- it under the terms of the GNU General Public License as published by
- the Free Software Foundation, either version 3 of the License, or
- (at your option) any later version.
+This software and associated documentation files (the "Software") are the
+proprietary property of Impulse Hosting. Unauthorized copying, distribution,
+modification, or use of this Software, in whole or in part, is strictly
+prohibited without prior written permission from Impulse Hosting.
 
- This program is distributed in the hope that it will be useful,
- but WITHOUT ANY WARRANTY; without even the implied warranty of
- MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- GNU General Public License for more details.
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
 
- You should have received a copy of the GNU General Public License
- along with this program.  If not, see <https://www.gnu.org/licenses/>.
-
- For the full license text, see: https://www.gnu.org/licenses/gpl-3.0.txt
+For licensing inquiries: support@impulsehosting.com
