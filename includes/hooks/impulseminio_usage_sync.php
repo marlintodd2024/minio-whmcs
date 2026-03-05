@@ -1,18 +1,18 @@
 <?php
 /**
  * ImpulseMinio Usage Sync Hook
- * 
+ *
  * Runs hourly via dedicated cron to update storage AND bandwidth usage
  * for all active ImpulseDrive services.
- * 
+ *
  * Storage: queries MinIO via `mc du --json` for each service's buckets
  * Bandwidth: fetches cumulative monthly stats from MinIO server's Nginx log parser
- * 
+ *
  * Writes to tblhosting.diskusage (storage MB) and tblhosting.bwusage (bandwidth MB)
- * 
+ *
  * Place in: /includes/hooks/impulseminio_usage_sync.php
  * Cron wrapper: /crons/impulseminio_usage.php
- * 
+ *
  * @package ImpulseMinio
  * @version 2.0.0
  */
@@ -58,6 +58,7 @@ add_hook('CronJob', 1, function () {
 
         $endpoint = ($server->secure ? 'https://' : 'http://') . $server->hostname;
         $accessKey = $server->username;
+        /** @phpstan-ignore function.notFound */
         $secretKey = decrypt($server->password);
 
         if (empty($accessKey) || empty($secretKey)) {
