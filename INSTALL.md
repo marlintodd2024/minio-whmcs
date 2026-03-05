@@ -23,7 +23,7 @@ crons/impulseminio_usage.php  →  {whmcs_root}/crons/impulseminio_usage.php
 
 > **Note:** `{whmcs_root}` is the parent of the WHMCS web root. For example, if WHMCS is at `/var/www/whmcs/httpdocs/`, the crons directory is `/var/www/whmcs/crons/`.
 
-**Why two hook files?** The module-level `hooks.php` handles addon storage recalculation (billing events). The `includes/hooks/` file handles the suspension banner and sidebar cleanup. It must live there because Lagom and some WHMCS themes skip loading the module entirely for suspended services — a module-level hook would never fire when it's needed most.
+**Why multiple hook files?** The module-level `hooks.php` handles addon storage recalculation (billing events). The `impulseminio_hooks.php` in `includes/hooks/` handles the suspension banner and sidebar cleanup — it must live there because Lagom and some WHMCS themes skip loading the module entirely for suspended services. The `impulseminio_usage_sync.php` handles hourly usage tracking and history snapshots for the Statistics tab.
 
 Your final structure should look like:
 
@@ -35,11 +35,11 @@ whmcs_root/
 │   ├── includes/
 │   │   └── hooks/
 │   │       ├── impulseminio_hooks.php      ← suspension banner + sidebar hiding
-│   │       └── impulseminio_usage_sync.php ← hourly storage + bandwidth sync
+│   │       └── impulseminio_usage_sync.php ← hourly storage + bandwidth + history sync
 │   └── modules/
 │       └── servers/
 │           └── impulseminio/
-│               ├── impulseminio.php        ← main module (~1600 lines)
+│               ├── impulseminio.php        ← main module (~1725 lines)
 │               ├── hooks.php              ← addon storage recalculation
 │               ├── lib/
 │               │   └── MinioClient.php    ← mc CLI wrapper (~480 lines)
@@ -103,9 +103,9 @@ Create addons for extra storage:
 
 The `hooks.php` addon hook automatically recalculates disk limits when addons are activated, suspended, or terminated.
 
-## 6. Usage Tracking Setup
+## 6. Usage Tracking & Statistics Setup
 
-The module tracks storage and bandwidth usage hourly via a dedicated cron job.
+The module tracks storage and bandwidth usage hourly and displays historical charts in the Statistics tab.
 
 ### 6.1 WHMCS Server Setup
 
@@ -122,9 +122,9 @@ The module tracks storage and bandwidth usage hourly via a dedicated cron job.
    chown {whmcs_user}:{whmcs_group} {whmcs_logs}/impulseminio_usage_sync.log
    ```
 
-3. **Edit `impulseminio_usage_sync.php`** — update the `$logFile` path on line 25 to match your WHMCS log directory.
+3. **Edit `impulseminio_usage_sync.php`** — update the `$logFile` path (line 25) and `$bwStatsUrl` (line 29) to match your environment.
 
-4. **Edit `impulseminio_usage.php`** — update the `ROOTDIR` path on line 2 to point to your WHMCS web root.
+4. **Edit `impulseminio_usage.php`** (cron wrapper) — update the `ROOTDIR` path (line 2) to point to your WHMCS web root.
 
 5. **Add hourly cron entry** (run as your WHMCS system user, not root):
    ```bash
@@ -138,9 +138,11 @@ The module tracks storage and bandwidth usage hourly via a dedicated cron job.
    cat {whmcs_logs}/impulseminio_usage_sync.log
    ```
 
-### 6.2 MinIO Server Setup (Bandwidth Tracking)
+   You should see storage, bandwidth, and "History snapshot written" in the log.
 
-Bandwidth tracking requires Nginx log parsing on the MinIO server. This is optional — storage tracking works without it.
+### 6.2 MinIO Server Setup (Bandwidth + Prometheus Stats)
+
+The MinIO server runs a Python script that parses Nginx bandwidth logs and fetches Prometheus per-bucket metrics. This provides all 6 metrics for the Statistics tab.
 
 1. **Enable Prometheus metrics** in `/etc/default/minio`:
    ```
@@ -160,16 +162,16 @@ Bandwidth tracking requires Nginx log parsing on the MinIO server. This is optio
    access_log /var/log/nginx/impulsedrive_bandwidth.log impulsedrive;
    ```
 
-4. **Deploy the bandwidth stats script** — copy `infrastructure/impulsedrive_bandwidth_stats.py` to `/usr/local/bin/` on the MinIO server and add an hourly cron:
+4. **Deploy the stats script** — copy `infrastructure/impulsedrive_bandwidth_stats.py` to `/usr/local/bin/` on the MinIO server:
    ```bash
    chmod +x /usr/local/bin/impulsedrive_bandwidth_stats.py
-   # Add to root crontab:
-   5 * * * * /usr/bin/python3 /usr/local/bin/impulsedrive_bandwidth_stats.py >> /var/log/impulsedrive_bandwidth_stats.log 2>&1
    ```
 
-5. **Create stats directory**:
+5. **Create stats directory and add hourly cron**:
    ```bash
    mkdir -p /var/www/impulsedrive-stats
+   # Add to root crontab:
+   5 * * * * /usr/bin/python3 /usr/local/bin/impulsedrive_bandwidth_stats.py >> /var/log/impulsedrive_bandwidth_stats.log 2>&1
    ```
 
 6. **Add Nginx location** for the stats endpoint — in your MinIO S3 API server block, add above `location / {`:
@@ -180,32 +182,22 @@ Bandwidth tracking requires Nginx log parsing on the MinIO server. This is optio
    }
    ```
 
-7. **Update `impulseminio_usage_sync.php`** — set the `$bwStatsUrl` variable (line 27) to match your stats endpoint URL.
+7. **Set up log rotation** — copy `infrastructure/logrotate-impulsedrive` to `/etc/logrotate.d/impulsedrive` on the MinIO server.
 
-8. **Set up log rotation** — create `/etc/logrotate.d/impulsedrive`:
+8. **Test the stats endpoint**:
+   ```bash
+   python3 /usr/local/bin/impulsedrive_bandwidth_stats.py
+   curl -s https://your-minio-domain/___impulse_bw_stats_{YOUR_SECRET_KEY}
    ```
-   /var/log/nginx/impulsedrive_bandwidth.log {
-       daily
-       rotate 30
-       compress
-       delaycompress
-       missingok
-       notifempty
-       postrotate
-           [ -f /run/nginx.pid ] && kill -USR1 $(cat /run/nginx.pid)
-       endscript
-   }
-   ```
+   You should see JSON with per-bucket `storage_bytes`, `traffic_sent_bytes`, `traffic_received_bytes`, `object_count`, and `replication_received_bytes`.
 
 ## 7. Hooks Verification
 
-WHMCS auto-loads hooks from both locations:
+WHMCS auto-loads hooks from these locations:
 
-- `includes/hooks/impulseminio_hooks.php` — loaded on every page (handles suspension banner)
-- `includes/hooks/impulseminio_usage_sync.php` — loaded on cron (hourly usage sync)
-- `modules/servers/impulseminio/hooks.php` — loaded when module is active (handles addon storage)
-
-The display hook has a duplicate guard (`IMPULSEMINIO_DISPLAY_HOOK_LOADED`) so it won't fire twice if accidentally loaded from both locations.
+- `includes/hooks/impulseminio_hooks.php` — loaded on every page (suspension banner + sidebar)
+- `includes/hooks/impulseminio_usage_sync.php` — loaded on cron (hourly usage + history sync)
+- `modules/servers/impulseminio/hooks.php` — loaded when module is active (addon storage)
 
 To verify hooks are working:
 
@@ -213,7 +205,7 @@ To verify hooks are working:
 2. Enable module logging temporarily
 3. Test an addon activation — you should see `addonStorageRecalc` entries
 4. Suspend a test service — verify the banner appears in the client area
-5. Check the usage sync log after running the cron — should show storage and bandwidth stats
+5. Run the cron and check the log — should show storage, bandwidth, and history snapshot
 
 ## 8. Database Tables
 
@@ -221,6 +213,7 @@ The module auto-creates these tables on first use:
 
 - `mod_impulseminio_buckets` — tracks buckets per service
 - `mod_impulseminio_accesskeys` — tracks access keys per service
+- `mod_impulseminio_usage_history` — hourly usage snapshots for Statistics tab (auto-pruned at 90 days)
 
 No manual migration required.
 
@@ -231,9 +224,9 @@ No manual migration required.
 3. Check:
    - MinIO user was created (`mc admin user list {alias}`)
    - Bucket was created (`mc ls {alias}`)
-   - Client area shows the dashboard with connection details
+   - Client area shows the 6-tab dashboard with connection details
    - File Browser tab loads and lists objects
-   - Usage bars show storage/bandwidth after running the hourly cron
+   - Run the hourly cron, then check the Statistics tab shows chart data
 
 ## Troubleshooting
 
@@ -247,16 +240,24 @@ No manual migration required.
 
 **Addon storage not updating**: Verify addon names follow the `Extra {amount} {unit} Storage` pattern exactly.
 
-**Usage shows 0**: 
+**Usage shows 0**:
 - Check the usage sync log for errors
 - Verify the mc config directory (`/tmp/.mc-impulse-usage`) is writable by the WHMCS system user
 - Run the cron wrapper manually and check the log output
 - For bandwidth: verify the Nginx bandwidth log is being written and the stats endpoint returns JSON
 
-**mc alias permission denied**: The mc config directory was likely created by root. Delete it and recreate with correct ownership:
+**Statistics tab shows "No data available"**:
+- Verify `mod_impulseminio_usage_history` table exists and has rows
+- Run the hourly cron at least once to populate history data
+- Check browser console for AJAX errors — the endpoint uses POST via `fbAjax`
+- Verify `clientGetUsageHistory` is registered in `ClientAreaCustomButtonArray`
+
+**mc alias permission denied**: Delete and recreate the mc config directory with correct ownership:
 ```bash
 rm -rf /tmp/.mc-impulse-usage
 mkdir -p /tmp/.mc-impulse-usage
 chown {whmcs_user}:{whmcs_group} /tmp/.mc-impulse-usage
 chmod 700 /tmp/.mc-impulse-usage
 ```
+
+**Chart Y-axis shows scientific notation**: This was fixed in v2.4.0 with adaptive unit scaling. Ensure you're running the latest version.

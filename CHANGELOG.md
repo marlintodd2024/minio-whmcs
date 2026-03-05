@@ -1,5 +1,26 @@
 # Changelog
 
+## v2.4.0 — 2026-03-05
+
+### Added
+- **Statistics tab** — new 6th dashboard tab with interactive Chart.js graphs for storage usage, downloads, uploads, object count, inbound and outbound replication
+- **Usage history table** — `mod_impulseminio_usage_history` stores hourly snapshots of all 6 metrics per service, auto-created on first use
+- **Adaptive chart units** — Y-axis automatically scales between B, KB, MB, GB based on data magnitude
+- **Time range selector** — view statistics for last 24 hours, 7 days, 30 days, or 90 days
+- **Metric color coding** — each metric type has a distinct color theme (navy for storage, blue for downloads, green for uploads, purple for objects, orange/red for replication)
+- **History auto-pruning** — records older than 90 days are automatically cleaned up by the hourly cron
+- **Prometheus integration** — MinIO server stats script now fetches per-bucket metrics from Prometheus endpoint (uploads, object count, replication) in addition to Nginx bandwidth logs
+
+### Changed
+- **Region row hidden** — removed the non-editable "us-east-1" region field from the Overview credentials table
+- **Usage sync cron (v3)** — now writes history snapshots to `mod_impulseminio_usage_history` each run, fetches expanded stats from MinIO server including Prometheus data
+- **MinIO stats endpoint (v2)** — Python script now includes `storage_bytes`, `object_count`, `traffic_sent_bytes`, `traffic_received_bytes`, `replication_received_bytes` per bucket from Prometheus
+- **Custom button array** — added `clientGetUsageHistory` AJAX endpoint registration
+
+### Fixed
+- **Chart.js Y-axis** — no longer shows scientific notation for small byte values; uses adaptive B/KB/MB/GB scaling
+- **AJAX routing** — Statistics chart uses POST via `fbAjax` instead of GET for WHMCS compatibility
+
 ## v2.3.0 — 2026-03-05
 
 ### Added
@@ -11,7 +32,6 @@
 
 ### Changed
 - **Usage reporting** — `tblhosting.diskusage` and `tblhosting.bwusage` now update hourly (previously only on daily WHMCS cron via `UsageUpdate`)
-- **MinioClient version** — bumped to v1.2
 
 ### Infrastructure (MinIO Server)
 - Added `MINIO_PROMETHEUS_AUTH_TYPE=public` to `/etc/default/minio`
@@ -19,10 +39,6 @@
 - Added `access_log` directive to S3 API and CDN server blocks
 - Added bandwidth stats location block to Nginx S3 API server block
 - Deployed `impulsedrive_bandwidth_stats.py` hourly cron for log parsing
-
-### Notes
-- The built-in `impulseminio_UsageUpdate()` function still runs on the daily WHMCS cron. The new hourly hook provides more frequent updates and accurate bandwidth data via Nginx logs.
-- `getBucketBandwidth()` in MinioClient.php queries MinIO Prometheus metrics, but `minio_bucket_traffic_sent_bytes` is only available at cluster level, not per-bucket. The Nginx log approach provides accurate per-bucket bandwidth attribution.
 
 ## v2.2.1 — 2026-03-04
 

@@ -666,6 +666,7 @@ function impulseminio_renderClientArea(array $params = []): string
     $o .= '<li role="presentation"><a href="#tab-keys" data-toggle="tab"><i class="fas fa-key"></i> Access Keys <span class="badge">' . $keyCount . '</span></a></li>';
     $o .= '<li role="presentation"><a href="#tab-quickstart" data-toggle="tab"><i class="fas fa-rocket"></i> Quick Start</a></li>';
     $o .= '<li role="presentation"><a href="#tab-files" data-toggle="tab"><i class="fas fa-folder-open"></i> File Browser</a></li>';
+    $o .= '<li role="presentation"><a href="#tab-stats" data-toggle="tab"><i class="fas fa-chart-area"></i> Statistics</a></li>';
     $o .= '</ul>';
     $o .= '<div class="tab-content">';
 
@@ -691,7 +692,7 @@ function impulseminio_renderClientArea(array $params = []): string
     $o .= '<table class="table table-condensed" style="margin-bottom:15px;">';
     $o .= '<tbody>';
     $o .= '<tr><td style="width:160px;font-weight:600;vertical-align:middle;padding:10px;">S3 Endpoint</td><td><div class="input-group"><input type="text" class="form-control input-sm" id="s3endpoint" value="' . $ee . '" readonly style="font-family:monospace;"><span class="input-group-btn"><button class="btn btn-default btn-sm" onclick="idCopy(\'s3endpoint\')" title="Copy"><i class="fas fa-copy"></i></button></span></div></td></tr>';
-    $o .= '<tr><td style="font-weight:600;vertical-align:middle;padding:10px;">Region</td><td><input type="text" class="form-control input-sm" value="us-east-1" readonly style="font-family:monospace;max-width:200px;"></td></tr>';
+    //     $o .= '<tr><td style="font-weight:600;vertical-align:middle;padding:10px;">Region</td><td><input type="text" class="form-control input-sm" value="us-east-1" readonly style="font-family:monospace;max-width:200px;"></td></tr>';
     $o .= '<tr><td style="font-weight:600;vertical-align:middle;padding:10px;">Access Key</td><td><div class="input-group"><input type="text" class="form-control input-sm" id="accesskey" value="' . $eu . '" readonly style="font-family:monospace;"><span class="input-group-btn"><button class="btn btn-default btn-sm" onclick="idCopy(\'accesskey\')" title="Copy"><i class="fas fa-copy"></i></button></span></div></td></tr>';
     $o .= '<tr><td style="font-weight:600;vertical-align:middle;padding:10px;">Secret Key</td><td><div class="input-group"><input type="password" class="form-control input-sm" id="secretkey" value="' . $ep . '" readonly style="font-family:monospace;"><span class="input-group-btn"><button class="btn btn-default btn-sm" onclick="togglePw(\'secretkey\')" title="Show/Hide"><i class="fas fa-eye" id="secretkey-eye"></i></button><button class="btn btn-default btn-sm" onclick="idCopy(\'secretkey\')" title="Copy"><i class="fas fa-copy"></i></button></span></div></td></tr>';
     $o .= '<tr><td style="font-weight:600;vertical-align:middle;padding:10px;">Default Bucket</td><td><div class="input-group"><input type="text" class="form-control input-sm" id="bucketname" value="' . $defaultBucket . '" readonly style="font-family:monospace;"><span class="input-group-btn"><button class="btn btn-default btn-sm" onclick="idCopy(\'bucketname\')" title="Copy"><i class="fas fa-copy"></i></button></span></div></td></tr>';
@@ -849,11 +850,57 @@ function impulseminio_renderClientArea(array $params = []): string
 
     $o .= '</div></div></div>';
 
+    // ─── Statistics Tab ───
+    $o .= '<div role="tabpanel" class="tab-pane" id="tab-stats">';
+    $o .= '<div class="panel panel-default"><div class="panel-heading" style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:10px;">';
+    $o .= '<h3 class="panel-title" style="margin:0;"><i class="fas fa-chart-area"></i> Storage Statistics</h3>';
+    $o .= '<div style="display:flex;align-items:center;gap:10px;">';
+    $o .= '<select id="stats-metric" class="form-control input-sm" style="width:auto;" onchange="statsRefresh()">';
+    $o .= '<option value="storage" selected>Storage Usage</option>';
+    $o .= '<option value="downloads">Downloads</option>';
+    $o .= '<option value="uploads">Uploads</option>';
+    $o .= '<option value="objects">Object Count</option>';
+    $o .= '<option value="replication_in">Inbound Replication</option>';
+    $o .= '<option value="replication_out">Outbound Replication</option>';
+    $o .= '</select>';
+    $o .= '<select id="stats-range" class="form-control input-sm" style="width:auto;" onchange="statsRefresh()">';
+    $o .= '<option value="24h">Last 24 Hours</option>';
+    $o .= '<option value="7d" selected>Last 7 Days</option>';
+    $o .= '<option value="30d">Last 30 Days</option>';
+    $o .= '<option value="90d">Last 90 Days</option>';
+    $o .= '</select>';
+    $o .= '</div></div>';
+    $o .= '<div class="panel-body">';
+    $o .= '<div id="stats-loading" style="text-align:center;padding:40px;"><i class="fas fa-spinner fa-spin fa-2x" style="color:#999;"></i></div>';
+    $o .= '<div id="stats-total" style="display:none;text-align:right;font-size:14px;color:#555;margin-bottom:10px;font-weight:600;"></div>';
+    $o .= '<div style="position:relative;height:350px;"><canvas id="stats-chart" style="display:none;"></canvas></div>';
+    $o .= '<div id="stats-empty" style="display:none;text-align:center;padding:40px;color:#999;"><i class="fas fa-chart-line" style="font-size:32px;display:block;margin-bottom:8px;"></i>No data available for this period</div>';
+    $o .= '<p style="margin-top:10px;font-size:12px;color:#999;">Statistics are collected hourly and may take up to 1 hour to reflect recent changes.</p>';
+    $o .= '</div></div></div>';
     $o .= '</div>'; // tab-content
     $o .= '</div>'; // impulsedrive-dashboard
 
     // JavaScript
+    $o .= '<script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.min.js"></script>';
     $o .= '<script>';
+    // Statistics chart functions
+    $o .= 'var statsChart=null;var statsChartCtx=null;';
+    $o .= 'function statsFormatBytes(b){if(b===0)return"0 B";var k=1024,s=["B","KB","MB","GB","TB"],i=Math.floor(Math.log(b)/Math.log(k));return parseFloat((b/Math.pow(k,i)).toFixed(2))+" "+s[i];}';
+    $o .= 'function statsFormatNum(n){return n.toLocaleString();}';
+    $o .= 'function statsRefresh(){var m=document.getElementById("stats-metric").value;var r=document.getElementById("stats-range").value;var el=document.getElementById("stats-loading");var ch=document.getElementById("stats-chart");var em=document.getElementById("stats-empty");var to=document.getElementById("stats-total");el.style.display="block";ch.style.display="none";em.style.display="none";to.style.display="none";';
+    $o .= 'fbAjax("clientGetUsageHistory",{metric:m,range:r},function(d){el.style.display="none";try{if(!d.success||d.labels.length===0){em.style.display="block";return;}';
+    $o .= 'ch.style.display="block";to.style.display="block";';
+    $o .= 'var fmt=d.isBytes?statsFormatBytes:statsFormatNum;to.textContent="Total: "+fmt(d.total);';
+    $o .= 'var labels=d.labels.map(function(l){var dt=new Date(l.replace(" ","T")+"Z");if(d.range==="24h")return dt.toLocaleTimeString([],{hour:"2-digit",minute:"2-digit"});return dt.toLocaleDateString([],{month:"short",day:"numeric"})+(d.range==="7d"?" "+dt.toLocaleTimeString([],{hour:"2-digit",minute:"2-digit"}):"");});';
+    $o .= 'var maxVal=d.isBytes?Math.max.apply(null,d.values):0;var divisor=1;var yUnit="B";if(d.isBytes){if(maxVal>=1073741824){divisor=1073741824;yUnit="GB";}else if(maxVal>=1048576){divisor=1048576;yUnit="MB";}else if(maxVal>=1024){divisor=1024;yUnit="KB";}else{divisor=1;yUnit="B";}}var values=d.isBytes?d.values.map(function(v){return v/divisor;}):d.values;var _statsDivisor=divisor;';
+    $o .= 'var yLabel=d.isBytes?yUnit:(d.metric==="objects"?"Objects":"Count");';
+    $o .= 'var colors={"storage":["rgba(26,26,46,0.15)","rgba(26,26,46,0.8)"],"downloads":["rgba(52,152,219,0.15)","rgba(52,152,219,0.8)"],"uploads":["rgba(46,204,113,0.15)","rgba(46,204,113,0.8)"],"objects":["rgba(155,89,182,0.15)","rgba(155,89,182,0.8)"],"replication_in":["rgba(230,126,34,0.15)","rgba(230,126,34,0.8)"],"replication_out":["rgba(231,76,60,0.15)","rgba(231,76,60,0.8)"]};';
+    $o .= 'var c=colors[d.metric]||colors.storage;';
+    $o .= 'if(statsChart){statsChart.destroy();}';
+    $o .= 'if(!statsChartCtx)statsChartCtx=document.getElementById("stats-chart").getContext("2d");';
+    $o .= 'statsChart=new Chart(statsChartCtx,{type:"line",data:{labels:labels,datasets:[{label:document.getElementById("stats-metric").options[document.getElementById("stats-metric").selectedIndex].text,data:values,backgroundColor:c[0],borderColor:c[1],borderWidth:2,fill:true,tension:0.3,pointRadius:d.labels.length>100?0:3,pointHoverRadius:5}]},options:{responsive:true,maintainAspectRatio:false,interaction:{mode:"index",intersect:false},scales:{y:{beginAtZero:true,title:{display:true,text:yLabel}},x:{ticks:{maxTicksToShow:12,maxRotation:45}}},plugins:{tooltip:{callbacks:{label:function(ctx){return d.isBytes?statsFormatBytes(ctx.raw*_statsDivisor):statsFormatNum(ctx.raw);}}}}}});';
+    $o .= '}catch(e){em.style.display="block";console.error("Stats error:",e);}});}';
+    $o .= 'document.querySelectorAll(".nav-tabs a[href=\'#tab-stats\']").forEach(function(a){a.addEventListener("click",function(){setTimeout(function(){if(!statsChart)statsRefresh();},150);});});';
     $o .= 'function idCopy(id){var i=document.getElementById(id),ot=i.type;i.type="text";i.select();i.setSelectionRange(0,99999);navigator.clipboard?navigator.clipboard.writeText(i.value):document.execCommand("copy");i.type=ot;var b=i.closest(".input-group").querySelector("[title=Copy]");if(b){var oh=b.innerHTML;b.innerHTML=\'<i class="fas fa-check text-success"></i>\';setTimeout(function(){b.innerHTML=oh;},1500);}}';
     $o .= 'function togglePw(id){var i=document.getElementById(id),ic=document.getElementById(id+"-eye");if(i.type==="password"){i.type="text";ic.className="fas fa-eye-slash";}else{i.type="password";ic.className="fas fa-eye";}}';
     $o .= 'var csrfToken=(document.querySelector("input[name=token]")||{}).value||"";function deleteBucket(n){if(!confirm("Delete bucket \\""+n+"\\"? All files will be permanently deleted.")){return;}var f=document.createElement("form");f.method="post";f.action="clientarea.php?action=productdetails&id=' . $serviceId . '#buckets";f.innerHTML=\'<input type="hidden" name="token" value="\'+ csrfToken+\'"><input type="hidden" name="modop" value="custom"><input type="hidden" name="a" value="clientDeleteBucket"><input type="hidden" name="id" value="' . $serviceId . '"><input type="hidden" name="bucket_name" value="\'+n+\'">\';document.body.appendChild(f);f.submit();}';
@@ -958,9 +1005,9 @@ DLCRED;
     if ($hasNewKeyFlash) {
         $o .= 'h="#accesskeys";';
     }
-    $o .= 'if(h){var map={"#buckets":"#tab-buckets","#accesskeys":"#tab-keys","#quickstart":"#tab-quickstart","#overview":"#tab-overview","#files":"#tab-files"};var target=map[h]||h;var tabLink=document.querySelector(\'.nav-tabs a[href="\'+target+\'"]\');if(tabLink){var evt=document.createEvent("HTMLEvents");evt.initEvent("click",true,true);tabLink.dispatchEvent(evt);if(typeof jQuery!=="undefined"){jQuery(tabLink).tab("show");}else{document.querySelectorAll(".nav-tabs li").forEach(function(li){li.classList.remove("active");});tabLink.parentElement.classList.add("active");document.querySelectorAll(".tab-pane").forEach(function(p){p.classList.remove("active");});var pane=document.querySelector(target);if(pane)pane.classList.add("active");}}}';
+    $o .= 'if(h){var map={"#buckets":"#tab-buckets","#accesskeys":"#tab-keys","#quickstart":"#tab-quickstart","#overview":"#tab-overview","#files":"#tab-files","#statistics":"#tab-stats"};var target=map[h]||h;var tabLink=document.querySelector(\'.nav-tabs a[href="\'+target+\'"]\');if(tabLink){var evt=document.createEvent("HTMLEvents");evt.initEvent("click",true,true);tabLink.dispatchEvent(evt);if(typeof jQuery!=="undefined"){jQuery(tabLink).tab("show");}else{document.querySelectorAll(".nav-tabs li").forEach(function(li){li.classList.remove("active");});tabLink.parentElement.classList.add("active");document.querySelectorAll(".tab-pane").forEach(function(p){p.classList.remove("active");});var pane=document.querySelector(target);if(pane)pane.classList.add("active");}}}';
     // Fix 8: Handle tab clicks to update active indicator and URL hash
-    $o .= 'document.querySelectorAll(".nav-tabs a[data-toggle=tab]").forEach(function(a){a.addEventListener("click",function(){document.querySelectorAll(".nav-tabs li").forEach(function(li){li.classList.remove("active");});this.parentElement.classList.add("active");var revMap={"#tab-overview":"#overview","#tab-buckets":"#buckets","#tab-keys":"#accesskeys","#tab-quickstart":"#quickstart","#tab-files":"#files"};var frag=revMap[this.getAttribute("href")]||this.getAttribute("href");history.replaceState(null,null,frag);});});})()';    $o .= '</script>';
+    $o .= 'document.querySelectorAll(".nav-tabs a[data-toggle=tab]").forEach(function(a){a.addEventListener("click",function(){document.querySelectorAll(".nav-tabs li").forEach(function(li){li.classList.remove("active");});this.parentElement.classList.add("active");var revMap={"#tab-overview":"#overview","#tab-buckets":"#buckets","#tab-keys":"#accesskeys","#tab-quickstart":"#quickstart","#tab-files":"#files","#tab-stats":"#statistics"};var frag=revMap[this.getAttribute("href")]||this.getAttribute("href");history.replaceState(null,null,frag);});});})()';    $o .= '</script>';
 
     // CSS
     $o .= '<style>';
@@ -1014,6 +1061,7 @@ function impulseminio_ClientAreaCustomButtonArray(): array
         'Delete Object' => 'clientDeleteObject',
         'Create Folder' => 'clientCreateFolder',
         'Get Upload URL' => 'clientGetUploadUrl',
+        'Usage History' => 'clientGetUsageHistory',
     ];
 }
 
@@ -1497,6 +1545,76 @@ function impulseminio_clientCreateFolder(array $params): string
     }
 }
 
+/**
+ * AJAX: Return usage history data for the Statistics chart.
+ *
+ * @param  array $params WHMCS module parameters
+ * @return string JSON response
+ */
+function impulseminio_clientGetUsageHistory(array $params): string
+{
+    try {
+        $serviceId = (int)$params['serviceid'];
+        $metric = isset($_REQUEST['metric']) ? trim($_REQUEST['metric']) : 'storage';
+        $range = isset($_REQUEST['range']) ? trim($_REQUEST['range']) : '7d';
+
+        $validMetrics = ['storage', 'downloads', 'uploads', 'objects', 'replication_in', 'replication_out'];
+        if (!in_array($metric, $validMetrics)) $metric = 'storage';
+
+        $rangeMap = ['24h' => 24, '7d' => 168, '30d' => 720, '90d' => 2160];
+        $hours = $rangeMap[$range] ?? 168;
+
+        impulseminio_ensureTables();
+
+        $since = date('Y-m-d H:i:s', strtotime("-{$hours} hours"));
+
+        $columnMap = [
+            'storage' => 'storage_bytes',
+            'downloads' => 'bandwidth_sent_bytes',
+            'uploads' => 'bandwidth_received_bytes',
+            'objects' => 'object_count',
+            'replication_in' => 'replication_received_bytes',
+            'replication_out' => 'replication_sent_bytes',
+        ];
+        $column = $columnMap[$metric] ?? 'storage_bytes';
+
+        $rows = Capsule::table('mod_impulseminio_usage_history')
+            ->where('service_id', $serviceId)
+            ->where('recorded_at', '>=', $since)
+            ->orderBy('recorded_at')
+            ->select('recorded_at', $column . ' as value')
+            ->get();
+
+        $labels = [];
+        $values = [];
+        $total = 0;
+        foreach ($rows as $row) {
+            $labels[] = $row->recorded_at;
+            $val = (float)$row->value;
+            $values[] = $val;
+        }
+
+        // Total is the latest value for cumulative metrics
+        if (!empty($values)) {
+            $total = end($values);
+        }
+
+        $isBytes = in_array($metric, ['storage', 'downloads', 'uploads', 'replication_in', 'replication_out']);
+
+        return impulseminio_jsonResponse([
+            'success' => true,
+            'labels' => $labels,
+            'values' => $values,
+            'total' => $total,
+            'metric' => $metric,
+            'isBytes' => $isBytes,
+            'range' => $range,
+        ]);
+    } catch (\Exception $e) {
+        logModuleCall('impulseminio', __FUNCTION__, $params, $e->getMessage(), $e->getTraceAsString());
+        return impulseminio_jsonResponse(['success' => false, 'error' => 'Error: ' . $e->getMessage()]);
+    }
+}
 // =============================================================================
 // ADMIN AREA
 // =============================================================================

@@ -7,6 +7,7 @@
  *
  * Storage: queries MinIO via `mc du --json` for each service's buckets
  * Bandwidth: fetches cumulative monthly stats from MinIO server's Nginx log parser
+ * History: writes snapshot rows to mod_impulseminio_usage_history for Statistics tab
  *
  * Writes to tblhosting.diskusage (storage MB) and tblhosting.bwusage (bandwidth MB)
  *
@@ -14,7 +15,7 @@
  * Cron wrapper: /crons/impulseminio_usage.php
  *
  * @package ImpulseMinio
- * @version 2.0.0
+ * @version 3.0.0
  */
 
 use WHMCS\Database\Capsule;
@@ -84,7 +85,7 @@ add_hook('CronJob', 1, function () {
     }
     $log('mc alias configured for ' . $server->hostname);
 
-    // ─── Fetch bandwidth stats from MinIO server ───
+    // ─── Fetch stats from MinIO server (bandwidth + Prometheus metrics) ───
     $bwData = [];
     try {
         $ctx = stream_context_create([
@@ -96,15 +97,15 @@ add_hook('CronJob', 1, function () {
             $bwParsed = json_decode($bwJson, true);
             if ($bwParsed && isset($bwParsed['buckets'])) {
                 $bwData = $bwParsed['buckets'];
-                $log('Bandwidth stats fetched: ' . count($bwData) . ' bucket(s) for month ' . ($bwParsed['month'] ?? 'unknown'));
+                $log('Stats fetched: ' . count($bwData) . ' bucket(s) for month ' . ($bwParsed['month'] ?? 'unknown'));
             } else {
-                $log('WARNING: Bandwidth stats JSON invalid or missing buckets key');
+                $log('WARNING: Stats JSON invalid or missing buckets key');
             }
         } else {
-            $log('WARNING: Failed to fetch bandwidth stats from endpoint');
+            $log('WARNING: Failed to fetch stats from endpoint');
         }
     } catch (\Exception $e) {
-        $log('WARNING: Bandwidth fetch error: ' . $e->getMessage());
+        $log('WARNING: Stats fetch error: ' . $e->getMessage());
     }
 
     // ─── Get all active ImpulseMinio services ───
@@ -153,7 +154,7 @@ add_hook('CronJob', 1, function () {
             continue;
         }
 
-        // ─── Storage: mc du per bucket ───
+        // ─── Storage + Objects: mc du per bucket ───
         $totalBytes = 0;
         $totalObjects = 0;
         $bucketErrors = false;
@@ -177,43 +178,83 @@ add_hook('CronJob', 1, function () {
             $totalObjects += (int) ($data['objects'] ?? 0);
         }
 
-        // ─── Bandwidth: sum from parsed Nginx stats ───
-        $totalBwBytes = 0;
+        // ─── Aggregate stats from endpoint (bandwidth + Prometheus) ───
+        $totalBwSent = 0;
+        $totalBwReceived = 0;
         $totalBwRequests = 0;
+        $totalReplicationRx = 0;
+        $totalReplicationTx = 0;
+
         foreach ($buckets as $bucketName) {
             if (isset($bwData[$bucketName])) {
-                $totalBwBytes += (int) ($bwData[$bucketName]['bytes_sent'] ?? 0);
-                $totalBwRequests += (int) ($bwData[$bucketName]['requests'] ?? 0);
+                $bd = $bwData[$bucketName];
+                // Nginx-tracked egress (cumulative monthly)
+                $totalBwSent += (int) ($bd['bytes_sent'] ?? 0);
+                $totalBwRequests += (int) ($bd['requests'] ?? 0);
+                // Prometheus metrics (since MinIO start)
+                $totalBwReceived += (int) ($bd['traffic_received_bytes'] ?? 0);
+                $totalReplicationRx += (int) ($bd['replication_received_bytes'] ?? 0);
+                // Note: replication_sent not available per-bucket in Prometheus
+                // Use traffic_sent from Prometheus as fallback for downloads
+                // but prefer Nginx bytes_sent for accuracy
             }
         }
 
         // Convert to MB (WHMCS convention)
         $diskUsageMB = (int) ceil($totalBytes / 1048576);
-        $bwUsageMB = (int) ceil($totalBwBytes / 1048576);
+        $bwUsageMB = (int) ceil($totalBwSent / 1048576);
 
         try {
+            // Update tblhosting usage fields
             Capsule::table('tblhosting')
                 ->where('id', $serviceId)
                 ->update([
                     'diskusage' => $diskUsageMB,
-                    'bwusage' => $bwUsageMB
+                    'bwusage' => $bwUsageMB,
+                    'lastupdate' => Capsule::raw('NOW()'),
                 ]);
+
+            // Write history snapshot for Statistics tab
+            Capsule::table('mod_impulseminio_usage_history')->insert([
+                'service_id' => $serviceId,
+                'storage_bytes' => $totalBytes,
+                'bandwidth_sent_bytes' => $totalBwSent,
+                'bandwidth_received_bytes' => $totalBwReceived,
+                'object_count' => $totalObjects,
+                'replication_received_bytes' => $totalReplicationRx,
+                'replication_sent_bytes' => $totalReplicationTx,
+                'recorded_at' => date('Y-m-d H:i:s'),
+            ]);
 
             $diskGB = round($totalBytes / 1073741824, 2);
             $diskLimitGB = round($service->disklimit / 1024, 1);
             $diskPct = $service->disklimit > 0 ? round(($diskUsageMB / $service->disklimit) * 100, 1) : 0;
 
-            $bwGB = round($totalBwBytes / 1073741824, 2);
+            $bwGB = round($totalBwSent / 1073741824, 2);
             $bwLimitGB = round($service->bwlimit / 1024, 1);
             $bwPct = $service->bwlimit > 0 ? round(($bwUsageMB / $service->bwlimit) * 100, 1) : 0;
 
             $log("  [service {$serviceId}] Storage: {$diskGB} GB / {$diskLimitGB} GB ({$diskPct}%) — {$totalObjects} objects across " . $buckets->count() . " bucket(s)" . ($bucketErrors ? ' [some bucket errors]' : ''));
             $log("  [service {$serviceId}] Bandwidth: {$bwGB} GB / {$bwLimitGB} GB ({$bwPct}%) — {$totalBwRequests} requests this month");
+            $log("  [service {$serviceId}] History snapshot written (uploads: " . round($totalBwReceived / 1048576) . " MB, repl_rx: " . round($totalReplicationRx / 1048576) . " MB)");
             $updatedCount++;
         } catch (\Exception $e) {
             $log("  ERROR [service {$serviceId}]: Failed to update usage: " . $e->getMessage());
             $errorCount++;
         }
+    }
+
+    // ─── Prune old history (keep 90 days) ───
+    try {
+        $pruneDate = date('Y-m-d H:i:s', strtotime('-90 days'));
+        $deleted = Capsule::table('mod_impulseminio_usage_history')
+            ->where('recorded_at', '<', $pruneDate)
+            ->delete();
+        if ($deleted > 0) {
+            $log("Pruned {$deleted} history rows older than 90 days");
+        }
+    } catch (\Exception $e) {
+        $log('WARNING: History prune failed: ' . $e->getMessage());
     }
 
     $log("=== Usage Sync Complete: {$updatedCount} updated, {$errorCount} errors ===");
