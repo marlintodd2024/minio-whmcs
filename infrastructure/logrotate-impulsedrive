@@ -1,0 +1,11 @@
+/var/log/nginx/impulsedrive_bandwidth.log {
+    daily
+    rotate 30
+    compress
+    delaycompress
+    missingok
+    notifempty
+    postrotate
+        [ -f /run/nginx.pid ] && kill -USR1 $(cat /run/nginx.pid)
+    endscript
+}

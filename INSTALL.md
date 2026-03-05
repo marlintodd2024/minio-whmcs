@@ -8,30 +8,43 @@ Copy the module directory to your WHMCS installation:
 modules/servers/impulseminio/  →  {whmcs}/modules/servers/impulseminio/
 ```
 
-Then copy the display hook to the WHMCS hooks directory:
+Then copy the hooks to the WHMCS hooks directory:
 
 ```
-includes/hooks/impulseminio_hooks.php  →  {whmcs}/includes/hooks/impulseminio_hooks.php
+includes/hooks/impulseminio_hooks.php       →  {whmcs}/includes/hooks/impulseminio_hooks.php
+includes/hooks/impulseminio_usage_sync.php  →  {whmcs}/includes/hooks/impulseminio_usage_sync.php
 ```
+
+Then copy the cron wrapper:
+
+```
+crons/impulseminio_usage.php  →  {whmcs_root}/crons/impulseminio_usage.php
+```
+
+> **Note:** `{whmcs_root}` is the parent of the WHMCS web root. For example, if WHMCS is at `/var/www/whmcs/httpdocs/`, the crons directory is `/var/www/whmcs/crons/`.
 
 **Why two hook files?** The module-level `hooks.php` handles addon storage recalculation (billing events). The `includes/hooks/` file handles the suspension banner and sidebar cleanup. It must live there because Lagom and some WHMCS themes skip loading the module entirely for suspended services — a module-level hook would never fire when it's needed most.
 
 Your final structure should look like:
 
 ```
-whmcs/
-├── includes/
-│   └── hooks/
-│       └── impulseminio_hooks.php      ← suspension banner + sidebar hiding
-└── modules/
-    └── servers/
-        └── impulseminio/
-            ├── impulseminio.php         ← main module
-            ├── hooks.php               ← addon storage recalculation
-            ├── lib/
-            │   └── MinioClient.php     ← mc CLI wrapper
-            └── templates/
-                └── clientarea.tpl      ← Smarty template
+whmcs_root/
+├── crons/
+│   └── impulseminio_usage.php              ← hourly usage sync runner
+├── httpdocs/
+│   ├── includes/
+│   │   └── hooks/
+│   │       ├── impulseminio_hooks.php      ← suspension banner + sidebar hiding
+│   │       └── impulseminio_usage_sync.php ← hourly storage + bandwidth sync
+│   └── modules/
+│       └── servers/
+│           └── impulseminio/
+│               ├── impulseminio.php        ← main module (~1600 lines)
+│               ├── hooks.php              ← addon storage recalculation
+│               ├── lib/
+│               │   └── MinioClient.php    ← mc CLI wrapper (~480 lines)
+│               └── templates/
+│                   └── clientarea.tpl     ← Smarty template
 ```
 
 ## 2. Install MinIO `mc` CLI
@@ -52,7 +65,7 @@ Verify `exec()` is enabled in PHP (not in `disable_functions` in php.ini).
 1. Go to **WHMCS Admin → Configuration → Servers → Add New Server**
 2. Set:
    - **Name**: MinIO (or any label)
-   - **Hostname**: your MinIO API endpoint (e.g., `s3.impulsehosting.com`)
+   - **Hostname**: your MinIO API endpoint (e.g., `s3.yourdomain.com`)
    - **Username**: MinIO root access key
    - **Password**: MinIO root secret key
    - **Secure**: Check if using HTTPS
@@ -90,11 +103,106 @@ Create addons for extra storage:
 
 The `hooks.php` addon hook automatically recalculates disk limits when addons are activated, suspended, or terminated.
 
-## 6. Hooks Verification
+## 6. Usage Tracking Setup
+
+The module tracks storage and bandwidth usage hourly via a dedicated cron job.
+
+### 6.1 WHMCS Server Setup
+
+1. **Create the mc config directory** with correct ownership:
+   ```bash
+   mkdir -p /tmp/.mc-impulse-usage
+   chown {whmcs_user}:{whmcs_group} /tmp/.mc-impulse-usage
+   chmod 700 /tmp/.mc-impulse-usage
+   ```
+
+2. **Create the log file**:
+   ```bash
+   touch {whmcs_logs}/impulseminio_usage_sync.log
+   chown {whmcs_user}:{whmcs_group} {whmcs_logs}/impulseminio_usage_sync.log
+   ```
+
+3. **Edit `impulseminio_usage_sync.php`** — update the `$logFile` path on line 25 to match your WHMCS log directory.
+
+4. **Edit `impulseminio_usage.php`** — update the `ROOTDIR` path on line 2 to point to your WHMCS web root.
+
+5. **Add hourly cron entry** (run as your WHMCS system user, not root):
+   ```bash
+   #@desc: ImpulseMinio Usage Sync (hourly)
+   0  *  *  *  *  /path/to/php -f /path/to/crons/impulseminio_usage.php
+   ```
+
+6. **Test manually**:
+   ```bash
+   su - {whmcs_user} -s /bin/bash -c "/path/to/php -f /path/to/crons/impulseminio_usage.php"
+   cat {whmcs_logs}/impulseminio_usage_sync.log
+   ```
+
+### 6.2 MinIO Server Setup (Bandwidth Tracking)
+
+Bandwidth tracking requires Nginx log parsing on the MinIO server. This is optional — storage tracking works without it.
+
+1. **Enable Prometheus metrics** in `/etc/default/minio`:
+   ```
+   MINIO_PROMETHEUS_AUTH_TYPE=public
+   ```
+   Restart MinIO after this change.
+
+2. **Add Nginx log format** to `/etc/nginx/nginx.conf` (inside the `http {}` block):
+   ```nginx
+   log_format impulsedrive '$host $remote_addr [$time_local] '
+                           '"$request_method $request_uri" '
+                           '$status $body_bytes_sent';
+   ```
+
+3. **Add access logging** to your MinIO Nginx server blocks (S3 API and CDN):
+   ```nginx
+   access_log /var/log/nginx/impulsedrive_bandwidth.log impulsedrive;
+   ```
+
+4. **Deploy the bandwidth stats script** — copy `infrastructure/impulsedrive_bandwidth_stats.py` to `/usr/local/bin/` on the MinIO server and add an hourly cron:
+   ```bash
+   chmod +x /usr/local/bin/impulsedrive_bandwidth_stats.py
+   # Add to root crontab:
+   5 * * * * /usr/bin/python3 /usr/local/bin/impulsedrive_bandwidth_stats.py >> /var/log/impulsedrive_bandwidth_stats.log 2>&1
+   ```
+
+5. **Create stats directory**:
+   ```bash
+   mkdir -p /var/www/impulsedrive-stats
+   ```
+
+6. **Add Nginx location** for the stats endpoint — in your MinIO S3 API server block, add above `location / {`:
+   ```nginx
+   location = /___impulse_bw_stats_{YOUR_SECRET_KEY} {
+       alias /var/www/impulsedrive-stats/bandwidth.json;
+       default_type application/json;
+   }
+   ```
+
+7. **Update `impulseminio_usage_sync.php`** — set the `$bwStatsUrl` variable (line 27) to match your stats endpoint URL.
+
+8. **Set up log rotation** — create `/etc/logrotate.d/impulsedrive`:
+   ```
+   /var/log/nginx/impulsedrive_bandwidth.log {
+       daily
+       rotate 30
+       compress
+       delaycompress
+       missingok
+       notifempty
+       postrotate
+           [ -f /run/nginx.pid ] && kill -USR1 $(cat /run/nginx.pid)
+       endscript
+   }
+   ```
+
+## 7. Hooks Verification
 
 WHMCS auto-loads hooks from both locations:
 
 - `includes/hooks/impulseminio_hooks.php` — loaded on every page (handles suspension banner)
+- `includes/hooks/impulseminio_usage_sync.php` — loaded on cron (hourly usage sync)
 - `modules/servers/impulseminio/hooks.php` — loaded when module is active (handles addon storage)
 
 The display hook has a duplicate guard (`IMPULSEMINIO_DISPLAY_HOOK_LOADED`) so it won't fire twice if accidentally loaded from both locations.
@@ -105,8 +213,9 @@ To verify hooks are working:
 2. Enable module logging temporarily
 3. Test an addon activation — you should see `addonStorageRecalc` entries
 4. Suspend a test service — verify the banner appears in the client area
+5. Check the usage sync log after running the cron — should show storage and bandwidth stats
 
-## 7. Database Tables
+## 8. Database Tables
 
 The module auto-creates these tables on first use:
 
@@ -115,15 +224,16 @@ The module auto-creates these tables on first use:
 
 No manual migration required.
 
-## 8. Verify Installation
+## 9. Verify Installation
 
 1. Create a test client and place a manual order
 2. Mark the order as paid
 3. Check:
-   - MinIO user was created (`mc admin user list impulse`)
-   - Bucket was created (`mc ls impulse`)
+   - MinIO user was created (`mc admin user list {alias}`)
+   - Bucket was created (`mc ls {alias}`)
    - Client area shows the dashboard with connection details
    - File Browser tab loads and lists objects
+   - Usage bars show storage/bandwidth after running the hourly cron
 
 ## Troubleshooting
 
@@ -131,8 +241,22 @@ No manual migration required.
 
 **mc CLI errors**: Check that the mc binary path in configoption5 is correct and executable by the web server user.
 
-**"Failed to create user"**: Verify MinIO root credentials in WHMCS server configuration. Check `mc admin info impulse` works from the command line.
+**"Failed to create user"**: Verify MinIO root credentials in WHMCS server configuration. Check `mc admin info {alias}` works from the command line.
 
 **File Browser not loading**: Check browser console for JS errors. The AJAX endpoints require WHMCS CSRF token — ensure the client area is loading correctly.
 
 **Addon storage not updating**: Verify addon names follow the `Extra {amount} {unit} Storage` pattern exactly.
+
+**Usage shows 0**: 
+- Check the usage sync log for errors
+- Verify the mc config directory (`/tmp/.mc-impulse-usage`) is writable by the WHMCS system user
+- Run the cron wrapper manually and check the log output
+- For bandwidth: verify the Nginx bandwidth log is being written and the stats endpoint returns JSON
+
+**mc alias permission denied**: The mc config directory was likely created by root. Delete it and recreate with correct ownership:
+```bash
+rm -rf /tmp/.mc-impulse-usage
+mkdir -p /tmp/.mc-impulse-usage
+chown {whmcs_user}:{whmcs_group} /tmp/.mc-impulse-usage
+chmod 700 /tmp/.mc-impulse-usage
+```

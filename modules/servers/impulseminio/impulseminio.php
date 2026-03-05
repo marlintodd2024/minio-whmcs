@@ -6,7 +6,7 @@
  * management, scoped access keys, usage tracking, and a 4-tab client dashboard.
  *
  * @package    ImpulseMinio
- * @version    2.1.1
+ * @version    2.3.0
  * @author     Impulse Hosting
  * @license    GPL-3.0
  * @link       https://github.com/ImpulseHosting/impulseminio

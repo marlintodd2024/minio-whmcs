@@ -1,5 +1,35 @@
 # Changelog
 
+## v2.3.0 — 2026-03-05
+
+### Added
+- **Hourly usage sync** — new dedicated cron hook (`impulseminio_usage_sync.php`) updates storage and bandwidth every hour instead of relying on WHMCS daily cron
+- **Nginx bandwidth tracking** — per-bucket egress tracking via Nginx access log parsing on the MinIO server, with cumulative monthly totals
+- **Bandwidth stats endpoint** — Python script on MinIO server generates per-bucket bandwidth JSON, served at a secret URL for WHMCS consumption
+- **Cron wrapper** — `crons/impulseminio_usage.php` for reliable hourly execution independent of WHMCS hook system
+- **Log rotation config** — logrotate template for Nginx bandwidth logs
+
+### Changed
+- **Usage reporting** — `tblhosting.diskusage` and `tblhosting.bwusage` now update hourly (previously only on daily WHMCS cron via `UsageUpdate`)
+- **MinioClient version** — bumped to v1.2
+
+### Infrastructure (MinIO Server)
+- Added `MINIO_PROMETHEUS_AUTH_TYPE=public` to `/etc/default/minio`
+- Added `log_format impulsedrive` to Nginx for per-bucket bandwidth logging
+- Added `access_log` directive to S3 API and CDN server blocks
+- Added bandwidth stats location block to Nginx S3 API server block
+- Deployed `impulsedrive_bandwidth_stats.py` hourly cron for log parsing
+
+### Notes
+- The built-in `impulseminio_UsageUpdate()` function still runs on the daily WHMCS cron. The new hourly hook provides more frequent updates and accurate bandwidth data via Nginx logs.
+- `getBucketBandwidth()` in MinioClient.php queries MinIO Prometheus metrics, but `minio_bucket_traffic_sent_bytes` is only available at cluster level, not per-bucket. The Nginx log approach provides accurate per-bucket bandwidth attribution.
+
+## v2.2.1 — 2026-03-04
+
+### Fixed
+- File browser download URL generation for files with special characters
+- Object listing pagination for buckets with >1000 objects
+
 ## v2.2.0 — 2026-03-04
 
 ### Added
