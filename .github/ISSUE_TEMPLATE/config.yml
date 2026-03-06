@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Documentation
+    url: https://github.com/marlintodd2024/minio-whmcs/blob/main/INSTALL.md
+    about: Check the installation guide before opening an issue
+  - name: Premium Support
+    url: https://www.impulsehosting.com
+    about: Licensed premium customers get priority support

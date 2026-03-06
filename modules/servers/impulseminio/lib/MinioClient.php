@@ -476,4 +476,30 @@ class MinioClient
         $r = $this->mc('admin info', [$this->mcAlias]);
         return $r['success'] ? ['success' => true, 'message' => 'OK'] : ['success' => false, 'message' => 'Failed: ' . $r['output']];
     }
+    /**
+     * Set anonymous access policy on a bucket.
+     *
+     * @param string $bucketName
+     * @param string $policy "download", "upload", "public", or "none"
+     * @return array
+     */
+    public function setAnonymousPolicy(string $bucketName, string $policy): array
+    {
+        $this->ensureAlias();
+        $r = $this->mc('anonymous set', [$policy, $this->mcAlias . '/' . $bucketName]);
+        return ['success' => $r['success'], 'output' => $r['output']];
+    }
+
+    /**
+     * Get anonymous access policy on a bucket.
+     *
+     * @param string $bucketName
+     * @return array
+     */
+    public function getAnonymousPolicy(string $bucketName): array
+    {
+        $this->ensureAlias();
+        $r = $this->mc('anonymous get', [$this->mcAlias . '/' . $bucketName]);
+        return ['success' => $r['success'], 'output' => $r['output']];
+    }
 }

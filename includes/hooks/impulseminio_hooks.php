@@ -47,7 +47,7 @@ add_hook('ClientAreaFooterOutput', 1, function($vars) {
     $js = 'document.addEventListener("DOMContentLoaded", function() {';
 
     // Always hide module action links from sidebar
-    $js .= '  var hideLabels = ["Create Bucket", "Delete Bucket", "Create Access Key", "Delete Access Key", "Toggle Versioning", "Reset Password", "List Objects", "Download Object", "Delete Object", "Create Folder", "Get Upload URL"];';
+    $js .= '  var hideLabels = ["Create Bucket", "Delete Bucket", "Create Access Key", "Delete Access Key", "Toggle Versioning", "Reset Password", "List Objects", "Download Object", "Delete Object", "Create Folder", "Get Upload URL", "Toggle Public", "Update CORS", "Usage History"];';
     $js .= '  document.querySelectorAll("a").forEach(function(a) {';
     $js .= '    var t = a.textContent.trim();';
     $js .= '    if (hideLabels.indexOf(t) !== -1) {';

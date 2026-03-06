@@ -5,7 +5,7 @@ S3-compatible object storage provisioning module for WHMCS. Automates user creat
 ## Features
 
 - **Automated provisioning** — creates MinIO users, buckets, and policies on order activation
-- **Client dashboard** — 6-tab interface: Overview, Buckets, Access Keys, Quick Start, File Browser, Statistics
+- **Client dashboard** — 6-tab interface: Overview, Quick Start, Buckets, Access Keys, File Browser, Statistics
 - **S3 Connection Details** — endpoint, credentials, plan limits, one-click copy
 - **Object Explorer** — browse, upload (drag-and-drop), download, and delete files directly from WHMCS
 - **Storage Statistics** — interactive Chart.js graphs with 6 metrics, 4 time ranges, and adaptive unit scaling
@@ -17,6 +17,16 @@ S3-compatible object storage provisioning module for WHMCS. Automates user creat
 - **Suspension handling** — disables MinIO user on suspend, re-enables on unsuspend
 - **Storage addons** — automatic disk limit adjustment when addons are purchased
 - **Upgrade/downgrade** — quota updates on plan changes with prorated billing support
+
+### Premium Features (licensed add-on)
+
+- **Public bucket access** — one-click toggle to make buckets publicly accessible via CDN
+- **CDN delivery** — objects served via virtual-hosted style URLs (`bucket.region.domain/object`)
+- **CORS configuration** — per-bucket allowed origins panel with validation
+- **Regional replication** — per-bucket replication jobs between MinIO regions *(planned)*
+- **Cloud data migration** — guided migration from AWS S3, Backblaze B2, Wasabi *(planned)*
+
+Premium features require the [ImpulseMinio Premium](https://www.impulsehosting.com) licensed add-on.
 
 ## Requirements
 
@@ -42,16 +52,15 @@ whmcs_root/
 │   └── modules/
 │       └── servers/
 │           └── impulseminio/
-│               ├── impulseminio.php        # Main module (~1725 lines)
+│               ├── impulseminio.php        # Main module
 │               ├── hooks.php              # Addon storage hooks
 │               ├── lib/
-│               │   └── MinioClient.php    # mc CLI wrapper (~480 lines)
+│               │   ├── MinioClient.php    # mc CLI wrapper
+│               │   ├── Premium.php        # (premium add-on) License validator
+│               │   └── PublicAccess.php   # (premium add-on) Static hosting
 │               └── templates/
-│                   └── clientarea.tpl     # Smarty template
-
-MinIO Server:
-├── /usr/local/bin/impulsedrive_bandwidth_stats.py  # Nginx + Prometheus stats
-└── /var/www/impulsedrive-stats/bandwidth.json      # Stats output (JSON)
+│                   ├── clientarea.tpl     # Smarty template
+│                   └── public_access.html # (premium add-on) CORS panel
 ```
 
 ## Product Configuration
@@ -59,32 +68,19 @@ MinIO Server:
 | Option | Field | Description |
 |--------|-------|-------------|
 | configoption1 | Disk Quota (GB) | Storage limit. 0 = unlimited |
-| configoption2 | Bandwidth Limit (GB) | Monthly transfer limit |
+| configoption2 | Bandwidth Limit (GB) | Monthly egress limit. 0 = unlimited |
 | configoption3 | Max Buckets | Bucket count limit. 0 = unlimited |
 | configoption4 | Max Access Keys | Key count limit. 0 = unlimited |
-| configoption5 | mc CLI Path | Default: `/usr/local/bin/mc` |
+| configoption5 | Overage Rate ($/GB) | Bandwidth overage rate. 0 = disabled |
 | configoption6 | S3 Endpoint URL | Override auto-detected endpoint |
 | configoption7 | Console URL | Link to MinIO Console (optional) |
-| configoption8 | Bucket Prefix | Custom prefix for bucket names |
-| configoption9 | Reserved | — |
+| configoption8 | mc Binary Path | Default: `/usr/local/bin/mc` |
+| configoption9 | Bucket Name Prefix | Custom prefix for bucket names |
 | configoption10 | Enable Versioning | Allow clients to toggle versioning |
-
-## Usage Tracking & Statistics
-
-The module tracks 6 metrics hourly and displays them in the Statistics tab:
-
-| Metric | Source | Description |
-|--------|--------|-------------|
-| Storage Usage | `mc du` | Total bytes stored across all buckets |
-| Downloads | Nginx logs | Egress bytes served to clients |
-| Uploads | Prometheus | Ingress bytes received from clients |
-| Object Count | `mc du` | Total number of objects stored |
-| Inbound Replication | Prometheus | Bytes received via bucket replication |
-| Outbound Replication | Prometheus | Bytes sent via bucket replication |
-
-Usage data is stored in `mod_impulseminio_usage_history` and automatically pruned after 90 days. The Statistics tab supports 4 time ranges (24h, 7d, 30d, 90d) with adaptive Y-axis scaling (B/KB/MB/GB).
-
-See [INSTALL.md](INSTALL.md) Section 6 for setup instructions.
+| configoption11 | CDN Endpoint | Public CDN base URL (premium) |
+| configoption12 | Enable Public Access | Allow public bucket toggle (premium) |
+| configoption13 | Max Public Buckets | Public bucket limit. 0 = unlimited (premium) |
+| configoption14 | Premium License Key | ImpulseMinio Premium license key |
 
 ## Database Tables
 
@@ -95,6 +91,8 @@ Auto-created on first use:
 | `mod_impulseminio_buckets` | Tracks buckets per service |
 | `mod_impulseminio_accesskeys` | Tracks access keys per service |
 | `mod_impulseminio_usage_history` | Hourly usage snapshots for Statistics tab |
+| `mod_impulseminio_public_buckets` | Public bucket state and CORS config (premium) |
+| `mod_impulseminio_license` | License validation cache (premium) |
 
 ## License
 

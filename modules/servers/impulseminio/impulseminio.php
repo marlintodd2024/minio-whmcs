@@ -65,6 +65,56 @@ function impulseminio_ensureTables(): void
 }
 
 // =============================================================================
+// PREMIUM DETECTION
+// =============================================================================
+/**
+ * Check if premium module files are present and licensed.
+ *
+ * @return bool
+ */
+function impulseminio_hasPremium(): bool
+{
+    static $result = null;
+    if ($result === null) {
+        if (!file_exists(__DIR__ . '/lib/Premium.php')) {
+            $result = false;
+        } else {
+            require_once __DIR__ . '/lib/Premium.php';
+            $result = \WHMCS\Module\Server\ImpulseMinio\Premium::isLicensed();
+        }
+    }
+    return $result;
+}
+
+/**
+ * Check if public access feature is available.
+ *
+ * @return bool
+ */
+function impulseminio_hasPublicAccess(): bool
+{
+    if (!impulseminio_hasPremium()) return false;
+    require_once __DIR__ . '/lib/Premium.php';
+    return \WHMCS\Module\Server\ImpulseMinio\Premium::hasFeature(
+        \WHMCS\Module\Server\ImpulseMinio\Premium::FEATURE_PUBLIC_ACCESS
+    );
+}
+
+/**
+ * Check if CORS feature is available.
+ *
+ * @return bool
+ */
+function impulseminio_hasCors(): bool
+{
+    if (!impulseminio_hasPremium()) return false;
+    require_once __DIR__ . '/lib/Premium.php';
+    return \WHMCS\Module\Server\ImpulseMinio\Premium::hasFeature(
+        \WHMCS\Module\Server\ImpulseMinio\Premium::FEATURE_CORS
+    );
+}
+
+// =============================================================================
 // METADATA & CONFIG
 // =============================================================================
 /**
@@ -158,6 +208,33 @@ function impulseminio_ConfigOptions(): array
         'Enable Versioning' => [
             'Type'        => 'yesno',
             'Description' => 'Enable S3 object versioning on customer buckets.',
+        ],
+        // === PREMIUM FEATURES (requires ImpulseMinio Premium license) ===
+        // configoption11
+        'CDN Endpoint' => [
+            'Type'        => 'text',
+            'Size'        => '50',
+            'Default'     => '',
+            'Description' => 'Public CDN base URL for static hosting (e.g. https://us-central-dallas.impulsedrive.io). Required for public bucket access.',
+        ],
+        // configoption12
+        'Enable Public Access' => [
+            'Type'        => 'yesno',
+            'Description' => 'Allow customers to make buckets publicly accessible via CDN. Requires Premium license.',
+        ],
+        // configoption13
+        'Max Public Buckets' => [
+            'Type'        => 'text',
+            'Size'        => '5',
+            'Default'     => '0',
+            'Description' => 'Maximum public buckets per customer. Set to 0 for unlimited.',
+        ],
+        // configoption14
+        'Premium License Key' => [
+            'Type'        => 'text',
+            'Size'        => '50',
+            'Default'     => '',
+            'Description' => 'ImpulseMinio Premium license key. Purchase at impulsehosting.com. Leave blank for free module only.',
         ],
     ];
 }
@@ -662,9 +739,9 @@ function impulseminio_renderClientArea(array $params = []): string
     $o .= '<div class="impulsedrive-dashboard">';
     $o .= '<ul class="nav nav-tabs" role="tablist" style="margin-bottom:20px;">';
     $o .= '<li role="presentation" class="active"><a href="#tab-overview" data-toggle="tab"><i class="fas fa-tachometer-alt"></i> Overview</a></li>';
+    $o .= '<li role="presentation"><a href="#tab-quickstart" data-toggle="tab"><i class="fas fa-rocket"></i> Quick Start</a></li>';
     $o .= '<li role="presentation"><a href="#tab-buckets" data-toggle="tab"><i class="fas fa-archive"></i> Buckets <span class="badge">' . $bucketCount . '</span></a></li>';
     $o .= '<li role="presentation"><a href="#tab-keys" data-toggle="tab"><i class="fas fa-key"></i> Access Keys <span class="badge">' . $keyCount . '</span></a></li>';
-    $o .= '<li role="presentation"><a href="#tab-quickstart" data-toggle="tab"><i class="fas fa-rocket"></i> Quick Start</a></li>';
     $o .= '<li role="presentation"><a href="#tab-files" data-toggle="tab"><i class="fas fa-folder-open"></i> File Browser</a></li>';
     $o .= '<li role="presentation"><a href="#tab-stats" data-toggle="tab"><i class="fas fa-chart-area"></i> Statistics</a></li>';
     $o .= '</ul>';
@@ -714,7 +791,7 @@ function impulseminio_renderClientArea(array $params = []): string
     $o .= '<div class="panel panel-default"><div class="panel-heading"><h3 class="panel-title"><i class="fas fa-chart-bar"></i> Usage Statistics</h3></div>';
     $o .= '<div class="panel-body"><div class="row">';
     $o .= '<div class="col-md-6"><h4>Storage Used</h4><div class="progress" style="height:25px;margin-bottom:5px;"><div class="progress-bar ' . $diskColor . '" role="progressbar" style="width:' . $diskPercent . '%;min-width:2em;line-height:25px;">' . $diskPercent . '%</div></div><p class="text-muted">' . $diskUsage . ' of ' . $diskLimit . ' used</p></div>';
-    $o .= '<div class="col-md-6"><h4>Bandwidth (This Month)</h4><div class="progress" style="height:25px;margin-bottom:5px;"><div class="progress-bar ' . $bwColor . '" role="progressbar" style="width:' . $bwPercent . '%;min-width:2em;line-height:25px;">' . $bwPercent . '%</div></div><p class="text-muted">' . $bwUsage . ' of ' . $bwLimit . ' transferred</p></div>';
+    $o .= '<div class="col-md-6"><h4>Bandwidth (Egress)</h4><div class="progress" style="height:25px;margin-bottom:5px;"><div class="progress-bar ' . $bwColor . '" role="progressbar" style="width:' . $bwPercent . '%;min-width:2em;line-height:25px;">' . $bwPercent . '%</div></div><p class="text-muted">' . $bwUsage . ' of ' . $bwLimit . ' transferred</p></div>';
     $o .= '</div>';
     $o .= '<small class="text-muted"><i class="fas fa-clock"></i> Last updated: ' . $lastUpdate . '</small>';
     $o .= '</div></div>';
@@ -727,11 +804,27 @@ function impulseminio_renderClientArea(array $params = []): string
     $o .= '<div class="panel panel-default"><div class="panel-heading"><h3 class="panel-title"><i class="fas fa-archive"></i> Your Buckets <span class="pull-right" style="font-size:13px;font-weight:normal;">' . $bucketCount . ' / ' . $mbDisplay . '</span></h3></div>';
     $o .= '<div class="panel-body">';
     $versioningHeader = $versioningAllowed ? '<th>Versioning</th>' : '';
-    $o .= '<table class="table table-striped table-hover"><thead><tr><th>Bucket Name</th><th>Label</th>' . $versioningHeader . '<th>Created</th><th></th></tr></thead><tbody>';
+    $o .= '<table class="table table-striped table-hover"><thead><tr><th>Bucket Name</th><th>Label</th>' . $versioningHeader . (impulseminio_hasPublicAccess() ? '<th style="width:100px;">Public</th>' : '') . '<th>Created</th><th></th></tr></thead><tbody>';
     foreach ($buckets as $b) {
         $bn = $esc($b->bucket_name);
         $bl = $esc($b->label ?: '-');
         $bc = $esc($b->created_at);
+        $publicCell = '';
+        if (impulseminio_hasPublicAccess()) {
+            require_once __DIR__ . '/lib/PublicAccess.php';
+            $isPub = \WHMCS\Module\Server\ImpulseMinio\PublicAccess::isPublic($serviceId, $b->bucket_name);
+            $cdnEndpoint = $params['configoption11'] ?? '';
+            $pubUrl = $isPub && $cdnEndpoint ? \WHMCS\Module\Server\ImpulseMinio\PublicAccess::getPublicUrl($cdnEndpoint, $b->bucket_name) : '';
+            $pubCopyBtn = $isPub && $pubUrl ? ' <button class="btn btn-xs btn-default" onclick="event.stopPropagation();navigator.clipboard.writeText(\'' . $esc($pubUrl) . '\').then(function(){alert(\'CDN URL copied to clipboard\')});" title="' . $esc($pubUrl) . '"><i class="fas fa-link"></i></button>' : '';
+            $corsBtn = '';
+            if ($isPub && impulseminio_hasCors()) {
+                $corsOrigins = \WHMCS\Module\Server\ImpulseMinio\PublicAccess::getCorsOrigins($serviceId, $b->bucket_name);
+                $corsValue = $esc(implode("\n", $corsOrigins));
+                $corsBtn = ' <button class="btn btn-xs btn-default" onclick="event.stopPropagation();toggleCorsPanel(\'' . $bn . '\')" title="CORS Settings"><i class="fas fa-cog"></i></button>';
+            }
+            $pubLabel = $isPub ? '<span class="label label-success" style="cursor:pointer;" onclick="togglePublic(\'' . $bn . '\')"><i class="fas fa-globe"></i> On</span>' . $pubCopyBtn . $corsBtn : '<span class="label label-default" style="cursor:pointer;" onclick="togglePublic(\'' . $bn . '\')">Off</span>';
+            $publicCell = '<td style="text-align:center;white-space:nowrap;">' . $pubLabel . '</td>';
+        }
         $primary = $b->is_primary ? ' <span class="label label-primary">Primary</span>' : '';
         $del = !$b->is_primary ? '<button class="btn btn-xs btn-danger" onclick="deleteBucket(\'' . $bn . '\')" title="Delete bucket"><i class="fas fa-trash"></i></button>' : '';
         $versioningCell = '';
@@ -743,7 +836,23 @@ function impulseminio_renderClientArea(array $params = []): string
             $title = $isOn ? 'Click to suspend versioning' : 'Click to enable versioning';
             $versioningCell = '<td><button class="btn btn-xs ' . $btnClass . '" onclick="toggleVersioning(\'' . $bn . '\')" title="' . $title . '"><i class="fas ' . $icon . '"></i> ' . $label . '</button></td>';
         }
-        $o .= '<tr><td><code>' . $bn . '</code>' . $primary . '</td><td>' . $bl . '</td>' . $versioningCell . '<td>' . $bc . '</td><td>' . $del . '</td></tr>';
+        $o .= '<tr><td><code>' . $bn . '</code>' . $primary . '</td><td>' . $bl . '</td>' . $versioningCell . $publicCell . '<td>' . $bc . '</td><td>' . $del . '</td></tr>';
+        if (!empty($corsBtn)) {
+            $o .= '<tr id="cors-panel-' . $bn . '" style="display:none;"><td colspan="6" style="background:#f8f9fa;padding:15px;">';
+            $o .= '<div style="max-width:500px;"><label style="font-weight:600;font-size:13px;margin-bottom:8px;"><i class="fas fa-globe"></i> Allowed CORS Origins</label>';
+            $o .= '<textarea id="cors-origins-' . $bn . '" class="form-control input-sm" rows="4" style="font-family:monospace;font-size:12px;margin-bottom:8px;" placeholder="*&#10;https://example.com&#10;https://app.example.com">' . $corsValue . '</textarea>';
+            $o .= '<div class="text-muted" style="font-size:11px;margin-bottom:10px;">';
+            $o .= '<strong>Examples:</strong><br>';
+            $o .= '<code>*</code> — allow all origins (default)<br>';
+            $o .= '<code>https://example.com</code> — allow a specific domain<br>';
+            $o .= '<code>https://app.example.com</code> — allow a subdomain<br>';
+            $o .= 'One origin per line. Must start with <code>http://</code> or <code>https://</code> (unless using <code>*</code>).';
+            $o .= '</div>';
+            $o .= '<div style="display:flex;justify-content:flex-end;gap:8px;">';
+            $o .= '<button class="btn btn-default btn-xs" onclick="toggleCorsPanel(\'' . $bn . '\')"><i class="fas fa-times"></i> Cancel</button>';
+            $o .= '<button class="btn btn-primary btn-xs" onclick="saveCors(\'' . $bn . '\')"><i class="fas fa-save"></i> Save CORS</button>';
+            $o .= '</div></div></td></tr>';
+        }
     }
     $o .= '</tbody></table>';
     if ($maxBuckets == 0 || $bucketCount < $maxBuckets) {
@@ -905,10 +1014,13 @@ function impulseminio_renderClientArea(array $params = []): string
     $o .= 'function togglePw(id){var i=document.getElementById(id),ic=document.getElementById(id+"-eye");if(i.type==="password"){i.type="text";ic.className="fas fa-eye-slash";}else{i.type="password";ic.className="fas fa-eye";}}';
     $o .= 'var csrfToken=(document.querySelector("input[name=token]")||{}).value||"";function deleteBucket(n){if(!confirm("Delete bucket \\""+n+"\\"? All files will be permanently deleted.")){return;}var f=document.createElement("form");f.method="post";f.action="clientarea.php?action=productdetails&id=' . $serviceId . '#buckets";f.innerHTML=\'<input type="hidden" name="token" value="\'+ csrfToken+\'"><input type="hidden" name="modop" value="custom"><input type="hidden" name="a" value="clientDeleteBucket"><input type="hidden" name="id" value="' . $serviceId . '"><input type="hidden" name="bucket_name" value="\'+n+\'">\';document.body.appendChild(f);f.submit();}';
     $o .= 'function deleteKey(k){if(!confirm("Revoke access key \\""+k+"\\"?")){return;}var f=document.createElement("form");f.method="post";f.action="clientarea.php?action=productdetails&id=' . $serviceId . '#accesskeys";f.innerHTML=\'<input type="hidden" name="token" value="\'+ csrfToken+\'"><input type="hidden" name="modop" value="custom"><input type="hidden" name="a" value="clientDeleteAccessKey"><input type="hidden" name="id" value="' . $serviceId . '"><input type="hidden" name="access_key_id" value="\'+k+\'">\';document.body.appendChild(f);f.submit();}';
+    $o .= 'function toggleCorsPanel(n){var p=document.getElementById("cors-panel-"+n);if(p)p.style.display=p.style.display==="none"?"table-row":"none";}';
+    $o .= 'function saveCors(n){var t=document.getElementById("cors-origins-"+n);if(!t)return;var lines=t.value.trim().split("\n").filter(function(l){return l.trim().length>0;});var valid=true;var bad="";for(var i=0;i<lines.length;i++){var l=lines[i].trim();if(l==="*")continue;if(!/^https?:\/\//.test(l)){valid=false;bad=l;break;}if(/\s/.test(l)){valid=false;bad=l;break;}}if(!valid){alert("Invalid origin: \""+bad+"\"\n\nOrigins must start with http:// or https:// (or use * for all).");return;}fbAjax("clientUpdateCors",{bucket_name:n,cors_origins:t.value},function(r){if(r.success){alert("CORS settings saved successfully.");toggleCorsPanel(n);}else{alert("Error: "+(r.error||"Unknown"));}});}';
+    $o .= 'function togglePublic(n){var f=document.createElement("form");f.method="post";f.action="clientarea.php?action=productdetails&id=' . $serviceId . '#buckets";f.innerHTML=\'<input type="hidden" name="token" value="\'+csrfToken+\'"><input type="hidden" name="modop" value="custom"><input type="hidden" name="a" value="clientTogglePublic"><input type="hidden" name="id" value="' . $serviceId . '"><input type="hidden" name="bucket_name" value="\'+n+\'">\';document.body.appendChild(f);f.submit();}';
     $o .= 'function toggleVersioning(n){var msg=confirm("Toggle versioning on bucket \\""+n+"\\"?")?true:false;if(!msg)return;var f=document.createElement("form");f.method="post";f.action="clientarea.php?action=productdetails&id=' . $serviceId . '#buckets";f.innerHTML=\'<input type="hidden" name="token" value="\'+ csrfToken+\'"><input type="hidden" name="modop" value="custom"><input type="hidden" name="a" value="clientToggleVersioning"><input type="hidden" name="id" value="' . $serviceId . '"><input type="hidden" name="bucket_name" value="\'+n+\'">\';document.body.appendChild(f);f.submit();}';
     $o .= 'function resetPassword(){if(!confirm("Reset your secret key? Your current key will stop working immediately. You will need to update all applications using the current key.")){return;}var f=document.createElement("form");f.method="post";f.action="clientarea.php?action=productdetails&id=' . $serviceId . '#overview";f.innerHTML=\'<input type="hidden" name="token" value="\'+ csrfToken+\'"><input type="hidden" name="modop" value="custom"><input type="hidden" name="a" value="clientResetPassword"><input type="hidden" name="id" value="' . $serviceId . '">\';document.body.appendChild(f);f.submit();}';
     // Copy All credentials to clipboard
-    $o .= 'function copyAllCreds(){var t="S3 Endpoint: "+document.getElementById("s3endpoint").value+"\\nRegion: us-east-1\\nAccess Key: "+document.getElementById("accesskey").value+"\\nSecret Key: "+document.getElementById("secretkey").value+"\\nDefault Bucket: "+document.getElementById("bucketname").value;navigator.clipboard?navigator.clipboard.writeText(t).then(function(){alert("Connection details copied to clipboard.")}):alert("Could not copy — use individual copy buttons instead.");}';
+    $o .= 'function copyAllCreds(){var t="S3 Endpoint: "+document.getElementById("s3endpoint").value+"\\nAccess Key: "+document.getElementById("accesskey").value+"\\nSecret Key: "+document.getElementById("secretkey").value+"\\nDefault Bucket: "+document.getElementById("bucketname").value;navigator.clipboard?navigator.clipboard.writeText(t).then(function(){alert("Connection details copied to clipboard.")}):alert("Could not copy — use individual copy buttons instead.");}';
     // Download credentials as .txt file with full connection info — reads from hidden fields
     $o .= <<<'DLCRED'
 function downloadCredentials(){
@@ -1062,6 +1174,8 @@ function impulseminio_ClientAreaCustomButtonArray(): array
         'Create Folder' => 'clientCreateFolder',
         'Get Upload URL' => 'clientGetUploadUrl',
         'Usage History' => 'clientGetUsageHistory',
+        'Toggle Public' => 'clientTogglePublic',
+        'Update CORS' => 'clientUpdateCors',
     ];
 }
 
@@ -1610,6 +1724,63 @@ function impulseminio_clientGetUsageHistory(array $params): string
             'isBytes' => $isBytes,
             'range' => $range,
         ]);
+    } catch (\Exception $e) {
+        logModuleCall('impulseminio', __FUNCTION__, $params, $e->getMessage(), $e->getTraceAsString());
+        return impulseminio_jsonResponse(['success' => false, 'error' => 'Error: ' . $e->getMessage()]);
+    }
+}
+/**
+ * Client action: toggle public access on a bucket.
+ */
+function impulseminio_clientTogglePublic(array $params): string
+{
+    try {
+        if (!impulseminio_hasPublicAccess()) {
+            header('Location: clientarea.php?action=productdetails&id=' . $params['serviceid'] . '#buckets');
+            exit;
+        }
+        $serviceId = (int)$params['serviceid'];
+        $bucketName = isset($_POST['bucket_name']) ? trim($_POST['bucket_name']) : '';
+        if (empty($bucketName)) {
+            header('Location: clientarea.php?action=productdetails&id=' . $serviceId . '#buckets');
+            exit;
+        }
+        require_once __DIR__ . '/lib/PublicAccess.php';
+        $client = impulseminio_getClient($params);
+        if (\WHMCS\Module\Server\ImpulseMinio\PublicAccess::isPublic($serviceId, $bucketName)) {
+            \WHMCS\Module\Server\ImpulseMinio\PublicAccess::disablePublic($client, $serviceId, $bucketName);
+        } else {
+            \WHMCS\Module\Server\ImpulseMinio\PublicAccess::enablePublic($client, $serviceId, $bucketName);
+        }
+        header('Location: clientarea.php?action=productdetails&id=' . $serviceId . '#buckets');
+        exit;
+    } catch (\Exception $e) {
+        logModuleCall('impulseminio', __FUNCTION__, $params, $e->getMessage(), $e->getTraceAsString());
+        header('Location: clientarea.php?action=productdetails&id=' . $params['serviceid'] . '#buckets');
+        exit;
+    }
+}
+
+/**
+ * Client action: update CORS origins for a public bucket.
+ */
+function impulseminio_clientUpdateCors(array $params): string
+{
+    try {
+        if (!impulseminio_hasCors()) {
+            return impulseminio_jsonResponse(['success' => false, 'error' => 'CORS configuration is not available.']);
+        }
+        $serviceId = (int)$params['serviceid'];
+        $bucketName = isset($_POST['bucket_name']) ? trim($_POST['bucket_name']) : '';
+        $originsRaw = isset($_POST['cors_origins']) ? trim($_POST['cors_origins']) : '*';
+        if (empty($bucketName)) {
+            return impulseminio_jsonResponse(['success' => false, 'error' => 'No bucket specified.']);
+        }
+        require_once __DIR__ . '/lib/PublicAccess.php';
+        $origins = array_filter(array_map('trim', explode("\n", $originsRaw)));
+        if (empty($origins)) $origins = ['*'];
+        $r = \WHMCS\Module\Server\ImpulseMinio\PublicAccess::setCorsOrigins($serviceId, $bucketName, $origins);
+        return impulseminio_jsonResponse($r);
     } catch (\Exception $e) {
         logModuleCall('impulseminio', __FUNCTION__, $params, $e->getMessage(), $e->getTraceAsString());
         return impulseminio_jsonResponse(['success' => false, 'error' => 'Error: ' . $e->getMessage()]);
