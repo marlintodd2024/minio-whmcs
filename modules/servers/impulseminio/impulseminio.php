@@ -850,6 +850,7 @@ function impulseminio_renderClientArea(array $params = []): string
             $o .= '<code>https://app.example.com</code> — allow a subdomain<br>';
             $o .= 'One origin per line. Must start with <code>http://</code> or <code>https://</code> (unless using <code>*</code>).';
             $o .= '</div>';
+            $o .= '<div class="alert alert-info" style="margin-top:10px;margin-bottom:10px;padding:10px 12px;font-size:12px;"><i class="fas fa-globe" style="margin-right:6px;"></i><strong>Static Website Hosting:</strong> Upload an <code>index.html</code> file to your public bucket and it will automatically be served as the homepage when visitors access your public URL.</div>';
             $o .= '<div style="display:flex;justify-content:flex-end;gap:8px;">';
             $o .= '<button class="btn btn-default btn-xs" onclick="toggleCorsPanel(\'' . $bn . '\')"><i class="fas fa-times"></i> Cancel</button>';
             $o .= '<button class="btn btn-primary btn-xs" onclick="saveCors(\'' . $bn . '\')"><i class="fas fa-save"></i> Save CORS</button>';
