@@ -810,6 +810,8 @@ function impulseminio_renderClientArea(array $params = []): string
         $bl = $esc($b->label ?: '-');
         $bc = $esc($b->created_at);
         $publicCell = '';
+        $corsBtn = '';
+        $corsValue = '';
         if (impulseminio_hasPublicAccess()) {
             require_once __DIR__ . '/lib/PublicAccess.php';
             $isPub = \WHMCS\Module\Server\ImpulseMinio\PublicAccess::isPublic($serviceId, $b->bucket_name);
@@ -1690,6 +1692,7 @@ function impulseminio_clientGetUsageHistory(array $params): string
             'replication_in' => 'replication_received_bytes',
             'replication_out' => 'replication_sent_bytes',
         ];
+        /** @phpstan-ignore offsetAccess.notFound */
         $column = $columnMap[$metric] ?? 'storage_bytes';
 
         $rows = Capsule::table('mod_impulseminio_usage_history')
