@@ -1692,8 +1692,7 @@ function impulseminio_clientGetUsageHistory(array $params): string
             'replication_in' => 'replication_received_bytes',
             'replication_out' => 'replication_sent_bytes',
         ];
-        /** @phpstan-ignore offsetAccess.notFound */
-        $column = $columnMap[$metric] ?? 'storage_bytes';
+        $column = $columnMap[$metric];
 
         $rows = Capsule::table('mod_impulseminio_usage_history')
             ->where('service_id', $serviceId)
