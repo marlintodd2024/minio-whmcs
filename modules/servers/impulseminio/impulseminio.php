@@ -330,6 +330,34 @@ function impulseminio_rebuildFullPolicy(array $params): array
  * @param  array  $params WHMCS module parameters
  * @return string "success" or error message
  */
+/**
+ * Derive a human-readable region label from an S3 endpoint URL.
+ *
+ * Maps known ImpulseDrive region slugs to display names.
+ * Falls back to the bare hostname if no match found.
+ *
+ * @param  string $endpoint  S3 endpoint URL (e.g. https://us-central-dallas.impulsedrive.io)
+ * @return string            Display label (e.g. "US Central — Dallas")
+ */
+function impulseminio_regionLabel(string $endpoint): string
+{
+    static $map = [
+        'us-central-dallas'     => 'US Central — Dallas',
+        'us-east-newark'        => 'US East — Newark',
+        'eu-west-london'        => 'EU West — London',
+        'ap-southeast-singapore' => 'AP Southeast — Singapore',
+    ];
+
+    $host = strtolower(parse_url($endpoint, PHP_URL_HOST) ?: $endpoint);
+    foreach ($map as $slug => $label) {
+        if (strpos($host, $slug) !== false) {
+            return $label;
+        }
+    }
+    // Fallback: return bare hostname so domain field is never blank
+    return $host;
+}
+
 function impulseminio_CreateAccount(array $params): string
 {
     try {
@@ -367,6 +395,7 @@ function impulseminio_CreateAccount(array $params): string
         ]);
         Capsule::table('tblhosting')->where('id', $params['serviceid'])->update([
             'username' => $username, 'password' => encrypt($password),
+            'domain'   => impulseminio_regionLabel($s3Endpoint),
             'diskusage' => 0,
             'disklimit' => $quotaGB > 0 ? $quotaGB * 1024 : 0,
             'bwusage' => 0,
@@ -939,7 +968,7 @@ function impulseminio_renderClientArea(array $params = []): string
     $o .= '</select>';
     $o .= '<nav id="fb-breadcrumb" style="flex:1;font-size:13px;"><a href="#" onclick="fbNavigate(null,\'\');return false;" style="font-weight:600;"><i class="fas fa-home"></i></a></nav>';
     $o .= '<button class="btn btn-success btn-sm" onclick="fbShowUpload()" title="Upload files"><i class="fas fa-upload"></i> Upload</button>';
-    $o .= '<button class="btn btn-default btn-sm" onclick="fbCreateFolder()" title="New folder"><i class="fas fa-folder-plus"></i> New Folder</button>';
+    $o .= '<button class="btn btn-default btn-sm" onclick="fbCreateFolder()" title="New folder"><i class="fas fa-folder-plus"></i> New Folder</button><button class="btn btn-default btn-sm" onclick="document.getElementById(&quot;fb-folder-input&quot;).click()" title="Upload folder"><i class="fas fa-folder-open"></i> Upload Folder</button>';
     $o .= '<button class="btn btn-default btn-sm" onclick="fbRefresh()" title="Refresh"><i class="fas fa-sync-alt"></i></button>';
     $o .= '</div>';
 
@@ -947,7 +976,7 @@ function impulseminio_renderClientArea(array $params = []): string
     $o .= '<div id="fb-upload-zone" style="display:none;margin-bottom:15px;padding:30px;border:2px dashed #ccc;border-radius:8px;text-align:center;background:#fafafa;cursor:pointer;" onclick="document.getElementById(\'fb-upload-input\').click()" ondrop="fbHandleDrop(event)" ondragover="event.preventDefault();this.style.borderColor=\'#1a1a2e\';this.style.background=\'#f0f0ff\'" ondragleave="this.style.borderColor=\'#ccc\';this.style.background=\'#fafafa\'">';
     $o .= '<i class="fas fa-cloud-upload-alt" style="font-size:32px;color:#999;margin-bottom:8px;display:block;"></i>';
     $o .= '<p style="margin:0;color:#666;">Drag and drop files here, or click to select</p>';
-    $o .= '<input type="file" id="fb-upload-input" multiple style="display:none;" onchange="fbUploadFiles(this.files)">';
+    $o .= '<input type="file" id="fb-upload-input" multiple style="display:none;" onchange="fbUploadFiles(this.files)"><input type="file" id="fb-folder-input" webkitdirectory style="display:none;" onchange="fbUploadFolder(this.files)">';
     $o .= '<div id="fb-upload-progress" style="margin-top:10px;"></div>';
     $o .= '</div>';
 
@@ -1112,6 +1141,7 @@ DLCRED;
 
     $o .= 'function fbUploadFiles(files){var prog=document.getElementById("fb-upload-progress");var total=files.length,done=0,failed=0;prog.innerHTML=\'<div class="progress" style="height:20px;"><div class="progress-bar progress-bar-striped active" style="width:0%;">0/\'+total+\'</div></div>\';for(var i=0;i<total;i++){(function(file){var objectKey=fbCurrentPrefix+file.name;fbAjax("clientGetUploadUrl",{bucket_name:fbCurrentBucket,object_key:objectKey},function(r){if(!r.success||!r.url){failed++;checkDone();return;}var fd=new FormData();if(r.fields){for(var k in r.fields){fd.append(k,r.fields[k]);}}fd.append("file",file);var xhr=new XMLHttpRequest();xhr.open("POST",r.url,true);xhr.onload=function(){if(xhr.status>=200&&xhr.status<300)done++;else failed++;checkDone();};xhr.onerror=function(){failed++;checkDone();};xhr.send(fd);});})(files[i]);}function checkDone(){var pct=Math.round(((done+failed)/total)*100);prog.querySelector(".progress-bar").style.width=pct+"%";prog.querySelector(".progress-bar").textContent=(done+failed)+"/"+total;if(done+failed>=total){setTimeout(function(){prog.innerHTML=\'<p class="text-success"><i class="fas fa-check"></i> \'+done+\' uploaded\'+( failed?\', <span class="text-danger">\'+failed+\' failed</span>\':\'\')+\'</p>\';document.getElementById("fb-upload-zone").style.display="none";fbRefresh();},500);}}}';
 
+    $o .= 'function fbUploadFolder(files){var prog=document.getElementById("fb-upload-progress");var total=files.length,done=0,failed=0;if(!total)return;prog.innerHTML=\'<div class="progress" style="height:20px;"><div class="progress-bar progress-bar-striped active" style="width:0%;">0/\'+total+\'</div></div>\';for(var i=0;i<total;i++){(function(file){var rel=file.webkitRelativePath||file.name;var objectKey=fbCurrentPrefix+rel;fbAjax("clientGetUploadUrl",{bucket_name:fbCurrentBucket,object_key:objectKey},function(r){if(!r.success||!r.url){failed++;checkDone();return;}var fd=new FormData();if(r.fields){for(var k in r.fields){fd.append(k,r.fields[k]);}}fd.append("file",file);var xhr=new XMLHttpRequest();xhr.open("POST",r.url,true);xhr.onload=function(){if(xhr.status>=200&&xhr.status<300)done++;else failed++;checkDone();};xhr.onerror=function(){failed++;checkDone();};xhr.send(fd);});})(files[i]);}function checkDone(){var pct=Math.round(((done+failed)/total)*100);prog.querySelector(".progress-bar").style.width=pct+"%";prog.querySelector(".progress-bar").textContent=(done+failed)+"/"+total;if(done+failed>=total){setTimeout(function(){prog.innerHTML=\'<p class="text-success"><i class="fas fa-check"></i> \'+done+\' uploaded\'+(failed?\', <span class="text-danger">\'+failed+\' failed</span>\':\'\')+\'</p>\';document.getElementById("fb-folder-input").value="";document.getElementById("fb-upload-zone").style.display="none";fbRefresh();},500);}}}';
     // Auto-load files when switching to file browser tab
     $o .= 'document.querySelectorAll(".nav-tabs a[href=\'#tab-files\']").forEach(function(a){a.addEventListener("click",function(){setTimeout(function(){if(document.getElementById("fb-body").children.length<=1)fbRefresh();},100);});});';
     // Fix 8: Activate correct tab from URL hash on page load

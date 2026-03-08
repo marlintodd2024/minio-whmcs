@@ -24,7 +24,8 @@ class MinioClient
         $this->secretKey = $secretKey;
         $this->mcPath    = $mcPath;
         $this->useSSL    = $useSSL;
-        $this->mcAlias   = 'impulse';
+        // Unique alias per endpoint to support multi-region connections
+        $this->mcAlias   = 'impulse-' . substr(md5($this->endpoint), 0, 8);
     }
 
     private function mc(string $command, array $args = [], bool $jsonOutput = false): array
@@ -331,6 +332,8 @@ class MinioClient
             if (empty($relKey)) continue;
             // Hide .keep marker files used for empty folder creation
             if ($relKey === '.keep' || substr($relKey, -6) === '/.keep') continue;
+            // Hide phantom '/' entries returned by mc ls for empty folders
+            if ($relKey === '/' || trim($relKey, '/') === '') continue;
             $isDir = (!empty($data['type']) && $data['type'] === 'folder')
                   || substr($relKey, -1) === '/';
             // mc ls returns keys relative to the listed path — prepend prefix for full path
