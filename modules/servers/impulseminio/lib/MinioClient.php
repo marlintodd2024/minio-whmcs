@@ -504,4 +504,140 @@ class MinioClient
         $r = $this->mc('anonymous get', [$this->mcAlias . '/' . $bucketName]);
         return ['success' => $r['success'], 'output' => $r['output']];
     }
+
+    // === REPLICATION ===
+
+    /**
+     * Enable versioning on a bucket (required for replication).
+     */
+    public function enableVersioning(string $bucketName): array
+    {
+        $this->ensureAlias();
+        $r = $this->mc('version enable', [$this->mcAlias . '/' . $bucketName]);
+        return ['success' => $r['success'], 'output' => $r['output']];
+    }
+
+    /**
+     * Add a remote replication target.
+     *
+     * @return array{success: bool, arn?: string, error?: string}
+     */
+    public function addRemoteTarget(string $srcBucket, string $destEndpoint, string $destBucket, string $accessKey, string $secretKey): array
+    {
+        $this->ensureAlias();
+        $target = $destEndpoint . '/' . $destBucket;
+        $r = $this->mc('admin bucket remote add', [
+            $this->mcAlias . '/' . $srcBucket,
+            $target,
+            '--service', 'replication',
+            '--access-key', $accessKey,
+            '--secret-key', $secretKey,
+        ]);
+
+        if (!$r['success']) {
+            return ['success' => false, 'error' => $r['output']];
+        }
+
+        // Parse ARN from output
+        $arn = '';
+        if (preg_match('/arn:minio:replication:[^:\s]+/', $r['output'], $m)) {
+            $arn = $m[0];
+        }
+
+        return ['success' => true, 'arn' => $arn];
+    }
+
+    /**
+     * Remove a remote replication target.
+     */
+    public function removeRemoteTarget(string $bucket, string $arn): array
+    {
+        $this->ensureAlias();
+        $r = $this->mc('admin bucket remote rm', [$this->mcAlias . '/' . $bucket, '--arn', $arn]);
+        return ['success' => $r['success'], 'output' => $r['output']];
+    }
+
+    /**
+     * Add a replication rule on a bucket.
+     *
+     * @return array{success: bool, rule_id?: string, error?: string}
+     */
+    public function addReplicationRule(string $bucket, string $remoteArn, string $replicateFlags = 'delete,delete-marker,existing-objects'): array
+    {
+        $this->ensureAlias();
+        $r = $this->mc('replicate add', [
+            $this->mcAlias . '/' . $bucket,
+            '--remote-bucket', $remoteArn,
+            '--replicate', $replicateFlags,
+        ], true);
+
+        if (!$r['success']) {
+            return ['success' => false, 'error' => $r['output']];
+        }
+
+        // Parse rule ID from JSON output
+        $ruleId = '';
+        $lines = explode("\n", trim($r['output']));
+        foreach ($lines as $line) {
+            $json = @json_decode($line, true);
+            if (isset($json['id'])) {
+                $ruleId = $json['id'];
+                break;
+            }
+        }
+
+        return ['success' => true, 'rule_id' => $ruleId];
+    }
+
+    /**
+     * Update a replication rule state (enable/disable).
+     */
+    public function updateReplicationRule(string $bucket, string $ruleId, string $state): array
+    {
+        $this->ensureAlias();
+        $r = $this->mc('replicate update', [
+            $this->mcAlias . '/' . $bucket,
+            '--id', $ruleId,
+            '--state', $state,
+        ]);
+        return ['success' => $r['success'], 'output' => $r['output']];
+    }
+
+    /**
+     * Remove a replication rule.
+     */
+    public function removeReplicationRule(string $bucket, string $ruleId): array
+    {
+        $this->ensureAlias();
+        $r = $this->mc('replicate rm', [$this->mcAlias . '/' . $bucket, '--id', $ruleId]);
+        return ['success' => $r['success'], 'output' => $r['output']];
+    }
+
+    /**
+     * Get replication status for a bucket.
+     */
+    public function getReplicationStatus(string $bucket): array
+    {
+        $this->ensureAlias();
+        $r = $this->mc('replicate status', [$this->mcAlias . '/' . $bucket], true);
+        if (!$r['success']) return ['success' => false, 'output' => $r['output']];
+
+        $status = [];
+        $lines = explode("\n", trim($r['output']));
+        foreach ($lines as $line) {
+            $json = @json_decode($line, true);
+            if ($json) $status[] = $json;
+        }
+        return ['success' => true, 'rules' => $status, 'output' => $r['output']];
+    }
+
+    /**
+     * Force-remove a bucket and all contents.
+     */
+    public function removeBucketForce(string $bucketName): array
+    {
+        $this->ensureAlias();
+        $r = $this->mc('rb', [$this->mcAlias . '/' . $bucketName, '--force']);
+        return ['success' => $r['success'], 'output' => $r['output']];
+    }
 }

@@ -88,6 +88,33 @@ function impulseminio_ensureTables(): void
             $t->timestamps();
         });
     }
+    // Replication jobs — tracks cross-region bucket replication
+    if (!Capsule::schema()->hasTable('mod_impulseminio_replication_jobs')) {
+        Capsule::schema()->create('mod_impulseminio_replication_jobs', function ($t) {
+            $t->increments('id');
+            $t->unsignedInteger('service_id')->index();
+            $t->unsignedInteger('source_region_id');
+            $t->string('source_bucket', 255);
+            $t->unsignedInteger('dest_region_id');
+            $t->string('dest_bucket', 255);
+            $t->string('description', 500)->nullable();
+            $t->string('remote_arn', 500)->nullable();
+            $t->string('rule_id', 100)->nullable();
+            $t->tinyInteger('sync_existing')->default(1);
+            $t->tinyInteger('sync_deletes')->default(1);
+            $t->tinyInteger('sync_locking')->default(0);
+            $t->tinyInteger('sync_metadata_date')->default(1);
+            $t->tinyInteger('sync_tags')->default(1);
+            $t->string('status', 20)->default('active');
+            $t->dateTime('suspended_at')->nullable();
+            $t->dateTime('purge_after')->nullable();
+            $t->tinyInteger('warning_sent')->default(0);
+            $t->dateTime('purge_notified_at')->nullable();
+            $t->dateTime('last_sync_at')->nullable();
+            $t->text('error_message')->nullable();
+            $t->timestamps();
+        });
+    }
 }
 
 // =============================================================================
