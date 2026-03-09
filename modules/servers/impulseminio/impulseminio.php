@@ -441,7 +441,7 @@ function impulseminio_CreateAccount(array $params): string
         if (!empty($params['configoptions'])) {
             foreach ($params['configoptions'] as $optName => $optValue) {
                 if (stripos($optName, 'region') !== false) {
-                    // WHMCS may pass: the slug text ("us-east-newark"), 
+                    // WHMCS may pass: the slug text ("us-east-newark"),
                     // the full optionname ("us-east-newark|US East — Newark"),
                     // or a numeric suboption ID (2050).
                     $slug = $optValue;
