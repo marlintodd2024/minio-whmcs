@@ -508,16 +508,6 @@ class MinioClient
     // === REPLICATION ===
 
     /**
-     * Enable versioning on a bucket (required for replication).
-     */
-    public function enableVersioning(string $bucketName): array
-    {
-        $this->ensureAlias();
-        $r = $this->mc('version enable', [$this->mcAlias . '/' . $bucketName]);
-        return ['success' => $r['success'], 'output' => $r['output']];
-    }
-
-    /**
      * Add a remote replication target.
      *
      * @return array{success: bool, arn?: string, error?: string}
