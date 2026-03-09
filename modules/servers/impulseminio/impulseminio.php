@@ -3,10 +3,11 @@
  * ImpulseMinio — MinIO S3 Cloud Storage Provisioning Module for WHMCS
  *
  * Provides automated provisioning of MinIO storage accounts with multi-bucket
- * management, scoped access keys, usage tracking, and a 4-tab client dashboard.
+ * management, scoped access keys, usage tracking, multi-region support,
+ * and a 6-tab client dashboard.
  *
  * @package    ImpulseMinio
- * @version    2.3.0
+ * @version    2.6.0
  * @author     Impulse Hosting
  * @license    GPL-3.0
  * @link       https://github.com/ImpulseHosting/impulseminio
@@ -59,6 +60,31 @@ function impulseminio_ensureTables(): void
             $t->string('access_key', 128);
             $t->string('name', 100)->default('');
             $t->text('bucket_scope')->nullable(); // JSON array of bucket names, null = all
+            $t->timestamps();
+        });
+    }
+    // Region registry — each row is a MinIO instance in a datacenter
+    if (!Capsule::schema()->hasTable('mod_impulseminio_regions')) {
+        Capsule::schema()->create('mod_impulseminio_regions', function ($t) {
+            $t->increments('id');
+            $t->string('name', 100);               // Display name: "US Central — Dallas"
+            $t->string('slug', 50)->unique();       // URL-safe: "us-central-dallas"
+            $t->string('flag', 10)->default('');     // Emoji flag: "🇺🇸"
+            $t->unsignedInteger('server_id');         // FK → tblservers.id
+            $t->string('cdn_endpoint', 255)->nullable(); // Public CDN base URL
+            $t->string('stats_url', 255)->nullable();    // Bandwidth stats JSON endpoint
+            $t->boolean('is_active')->default(true);
+            $t->unsignedInteger('sort_order')->default(0);
+            $t->timestamps();
+        });
+    }
+    // Links services to their primary (and future replication) regions
+    if (!Capsule::schema()->hasTable('mod_impulseminio_service_regions')) {
+        Capsule::schema()->create('mod_impulseminio_service_regions', function ($t) {
+            $t->increments('id');
+            $t->unsignedInteger('service_id')->index(); // FK → tblhosting.id
+            $t->unsignedInteger('region_id');            // FK → mod_impulseminio_regions.id
+            $t->boolean('is_primary')->default(true);
             $t->timestamps();
         });
     }
@@ -258,6 +284,74 @@ function impulseminio_getClient(array $params): MinioClient
 }
 
 /**
+ * Build a MinioClient for a specific region using its server record.
+ *
+ * Falls back to impulseminio_getClient() if region has no server_id
+ * or if the server record is missing.
+ *
+ * @param  int   $serverId WHMCS server ID from mod_impulseminio_regions
+ * @param  array $params   Module params (for mc path fallback)
+ * @return MinioClient
+ */
+function impulseminio_getClientForServer(int $serverId, array $params): MinioClient
+{
+    $server = Capsule::table('tblservers')->where('id', $serverId)->first();
+    if (!$server) {
+        throw new \Exception("Server ID {$serverId} not found in tblservers.");
+    }
+    $hostname = $server->hostname ?: $server->ipaddress;
+    $secure = (bool)$server->secure;
+    $port = $server->port ?: ($secure ? '443' : '9000');
+    $protocol = $secure ? 'https' : 'http';
+    $endpoint = ($secure && $port === '443') ? $protocol . '://' . $hostname : $protocol . '://' . $hostname . ':' . $port;
+    $password = decrypt($server->password);
+    return new MinioClient($endpoint, $server->username, $password, $params['configoption8'] ?: '/usr/local/bin/mc', $secure);
+}
+
+/**
+ * Resolve the primary region for a service.
+ *
+ * Checks mod_impulseminio_service_regions first. If no row exists
+ * (legacy service), returns null — callers fall back to the product's
+ * assigned WHMCS server via impulseminio_getClient().
+ *
+ * @param  int $serviceId
+ * @return object|null Region row from mod_impulseminio_regions
+ */
+function impulseminio_getPrimaryRegion(int $serviceId): ?object
+{
+    if (!Capsule::schema()->hasTable('mod_impulseminio_service_regions')) return null;
+    $link = Capsule::table('mod_impulseminio_service_regions')
+        ->where('service_id', $serviceId)
+        ->where('is_primary', true)
+        ->first();
+    if (!$link) return null;
+    return Capsule::table('mod_impulseminio_regions')
+        ->where('id', $link->region_id)
+        ->where('is_active', true)
+        ->first();
+}
+
+/**
+ * Get the correct MinioClient for a service — region-aware with legacy fallback.
+ *
+ * If the service has a primary region in mod_impulseminio_service_regions,
+ * connects to that region's server. Otherwise falls back to the product's
+ * default WHMCS server (legacy behavior).
+ *
+ * @param  array $params WHMCS module parameters
+ * @return MinioClient
+ */
+function impulseminio_getServiceClient(array $params): MinioClient
+{
+    $region = impulseminio_getPrimaryRegion((int)$params['serviceid']);
+    if ($region && !empty($region->server_id)) {
+        return impulseminio_getClientForServer((int)$region->server_id, $params);
+    }
+    return impulseminio_getClient($params);
+}
+
+/**
  * Derive the MinIO username for a service.
  *
  * Format: {prefix}-{serviceid}-{clientname} (lowercased, sanitised)
@@ -310,7 +404,7 @@ function impulseminio_getAllBuckets(int $serviceId): array
  */
 function impulseminio_rebuildFullPolicy(array $params): array
 {
-    $client = impulseminio_getClient($params);
+    $client = impulseminio_getServiceClient($params);
     $username = impulseminio_getUsername($params);
     $buckets = impulseminio_getAllBuckets((int)$params['serviceid']);
     if (empty($buckets)) {
@@ -334,7 +428,60 @@ function impulseminio_CreateAccount(array $params): string
 {
     try {
         impulseminio_ensureTables();
-        $client = impulseminio_getClient($params);
+
+        // Resolve region: check for region configurable option (customer's selection)
+        $regionId = null;
+        $client = null;
+        $s3Endpoint = '';
+
+        // Log configoptions for debugging
+        logModuleCall('impulseminio', 'CreateAccount:configoptions', $params['configoptions'] ?? 'EMPTY', '', '');
+
+        // Look for a "Region" configurable option in the order
+        if (!empty($params['configoptions'])) {
+            foreach ($params['configoptions'] as $optName => $optValue) {
+                if (stripos($optName, 'region') !== false) {
+                    // WHMCS may pass: the slug text ("us-east-newark"), 
+                    // the full optionname ("us-east-newark|US East — Newark"),
+                    // or a numeric suboption ID (2050).
+                    $slug = $optValue;
+
+                    // If numeric, resolve suboption ID → optionname → slug
+                    if (is_numeric($optValue)) {
+                        $sub = Capsule::table('tblproductconfigoptionssub')
+                            ->where('id', (int)$optValue)->first();
+                        if ($sub) {
+                            $slug = explode('|', $sub->optionname)[0];
+                        }
+                    } else {
+                        // Extract slug from "slug|Label" format if present
+                        $slug = explode('|', (string)$optValue)[0];
+                    }
+
+                    $region = Capsule::table('mod_impulseminio_regions')
+                        ->where('is_active', true)
+                        ->where('slug', $slug)
+                        ->first();
+                    if ($region) {
+                        $regionId = $region->id;
+                        $client = impulseminio_getClientForServer((int)$region->server_id, $params);
+                        $server = Capsule::table('tblservers')->where('id', $region->server_id)->first();
+                        if ($server) {
+                            $hostname = $server->hostname ?: $server->ipaddress;
+                            $s3Endpoint = ($server->secure ? 'https' : 'http') . '://' . $hostname;
+                        }
+                    }
+                    break;
+                }
+            }
+        }
+
+        // Fallback to product's assigned server (legacy / no region selected)
+        if (!$client) {
+            $client = impulseminio_getServiceClient($params);
+            $s3Endpoint = $params['configoption6'] ?: ($params['serversecure'] ? 'https' : 'http') . '://' . ($params['serverhostname'] ?: $params['serverip']);
+        }
+
         $username = impulseminio_getUsername($params);
         $bucket = impulseminio_getBucket($params);
         $password = MinioClient::generatePassword(24);
@@ -359,7 +506,25 @@ function impulseminio_CreateAccount(array $params): string
 
         if ($quotaGB > 0) $client->setBucketQuota($bucket, $quotaGB . 'GiB');
 
-        $s3Endpoint = $params['configoption6'] ?: ($params['serversecure'] ? 'https' : 'http') . '://' . ($params['serverhostname'] ?: $params['serverip']);
+        // Record the region assignment
+        if ($regionId) {
+            Capsule::table('mod_impulseminio_service_regions')->insert([
+                'service_id' => $params['serviceid'],
+                'region_id' => $regionId,
+                'is_primary' => true,
+                'created_at' => date('Y-m-d H:i:s'),
+                'updated_at' => date('Y-m-d H:i:s'),
+            ]);
+
+            // Also update the WHMCS service to point at the correct server
+            $region = Capsule::table('mod_impulseminio_regions')->where('id', $regionId)->first();
+            if ($region) {
+                Capsule::table('tblhosting')->where('id', $params['serviceid'])->update([
+                    'server' => $region->server_id,
+                ]);
+            }
+        }
+
         $params['model']->serviceProperties->save([
             'MinIO Username' => $username, 'MinIO Password' => $password,
             'Bucket Name' => $bucket, 'S3 Endpoint' => $s3Endpoint,
@@ -390,7 +555,7 @@ function impulseminio_CreateAccount(array $params): string
 function impulseminio_SuspendAccount(array $params): string
 {
     try {
-        $client = impulseminio_getClient($params);
+        $client = impulseminio_getServiceClient($params);
         $username = impulseminio_getUsername($params);
         $buckets = impulseminio_getAllBuckets((int)$params['serviceid']) ?: [impulseminio_getBucket($params)];
         $r = $client->disableUser($username);
@@ -417,7 +582,7 @@ function impulseminio_SuspendAccount(array $params): string
 function impulseminio_UnsuspendAccount(array $params): string
 {
     try {
-        $client = impulseminio_getClient($params);
+        $client = impulseminio_getServiceClient($params);
         $username = impulseminio_getUsername($params);
         $r = $client->enableUser($username);
         if (!$r['success']) return 'Failed to unsuspend: ' . $r['error'];
@@ -438,7 +603,7 @@ function impulseminio_UnsuspendAccount(array $params): string
 function impulseminio_TerminateAccount(array $params): string
 {
     try {
-        $client = impulseminio_getClient($params);
+        $client = impulseminio_getServiceClient($params);
         $username = impulseminio_getUsername($params);
         $serviceId = (int)$params['serviceid'];
 
@@ -475,7 +640,7 @@ function impulseminio_TerminateAccount(array $params): string
 function impulseminio_ChangePassword(array $params): string
 {
     try {
-        $client = impulseminio_getClient($params);
+        $client = impulseminio_getServiceClient($params);
         $username = impulseminio_getUsername($params);
         $r = $client->createUser($username, $params['password']);
         if (!$r['success']) return 'Failed: ' . $r['error'];
@@ -493,7 +658,7 @@ function impulseminio_ChangePassword(array $params): string
 function impulseminio_ChangePackage(array $params): string
 {
     try {
-        $client = impulseminio_getClient($params);
+        $client = impulseminio_getServiceClient($params);
         $quotaGB = (int)$params['configoption1'];
         $bwLimitGB = (int)$params['configoption2'];
         $buckets = impulseminio_getAllBuckets((int)$params['serviceid']) ?: [impulseminio_getBucket($params)];
@@ -527,7 +692,7 @@ function impulseminio_UsageUpdate(array $params): void
     $serverId = $params['serverid'];
     $services = Capsule::table('tblhosting')->where('server', $serverId)->where('domainstatus', 'Active')->get();
     if ($services->isEmpty()) return;
-    $client = impulseminio_getClient($params);
+    $client = impulseminio_getServiceClient($params);
 
     foreach ($services as $service) {
         try {
@@ -1220,7 +1385,7 @@ function impulseminio_clientCreateBucket(array $params): string
             return 'A bucket with that name already exists.';
         }
 
-        $client = impulseminio_getClient($params);
+        $client = impulseminio_getServiceClient($params);
         $r = $client->createBucket($bucketName);
         if (!$r['success']) return 'Failed to create bucket: ' . $r['error'];
 
@@ -1267,7 +1432,7 @@ function impulseminio_clientDeleteBucket(array $params): string
         if (!$bucket) return 'Bucket not found or not owned by this service.';
         if ($bucket->is_primary) return 'Cannot delete the primary bucket. Contact support if needed.';
 
-        $client = impulseminio_getClient($params);
+        $client = impulseminio_getServiceClient($params);
         $r = $client->deleteBucket($bucketName, true);
         if (!$r['success']) return 'Failed to delete bucket: ' . $r['error'];
 
@@ -1322,7 +1487,7 @@ function impulseminio_clientCreateAccessKey(array $params): string
         $scopeInput = isset($_POST['bucket_scope']) ? trim($_POST['bucket_scope']) : '';
 
         $username = impulseminio_getUsername($params);
-        $client = impulseminio_getClient($params);
+        $client = impulseminio_getServiceClient($params);
 
         // Determine bucket scope
         $bucketScope = null;
@@ -1378,7 +1543,7 @@ function impulseminio_clientDeleteAccessKey(array $params): string
             ->where('service_id', $serviceId)->where('access_key', $accessKeyId)->first();
         if (!$key) return 'Access key not found or not owned by this service.';
 
-        $client = impulseminio_getClient($params);
+        $client = impulseminio_getServiceClient($params);
         $r = $client->deleteAccessKey($accessKeyId);
         if (!$r['success']) return 'Failed to delete access key: ' . $r['error'];
 
@@ -1419,7 +1584,7 @@ function impulseminio_clientToggleVersioning(array $params): string
             ->where('service_id', $serviceId)->where('bucket_name', $bucketName)->first();
         if (!$bucket) return 'Bucket not found or not owned by this service.';
 
-        $client = impulseminio_getClient($params);
+        $client = impulseminio_getServiceClient($params);
         $currentlyEnabled = !empty($bucket->versioning);
 
         if ($currentlyEnabled) {
@@ -1455,7 +1620,7 @@ function impulseminio_clientToggleVersioning(array $params): string
 function impulseminio_clientResetPassword(array $params): string
 {
     try {
-        $client = impulseminio_getClient($params);
+        $client = impulseminio_getServiceClient($params);
         $username = impulseminio_getUsername($params);
         $newPassword = MinioClient::generatePassword(24);
 
@@ -1515,7 +1680,7 @@ function impulseminio_clientListObjects(array $params): string
             ->where('service_id', $serviceId)->where('bucket_name', $bucketName)->first();
         if (!$bucket) return impulseminio_jsonResponse(['success' => false, 'error' => 'Bucket not found.']);
 
-        $client = impulseminio_getClient($params);
+        $client = impulseminio_getServiceClient($params);
         $r = $client->listObjects($bucketName, $prefix);
 
         return impulseminio_jsonResponse([
@@ -1548,7 +1713,7 @@ function impulseminio_clientDownloadObject(array $params): string
             ->where('service_id', $serviceId)->where('bucket_name', $bucketName)->first();
         if (!$bucket) return impulseminio_jsonResponse(['success' => false, 'error' => 'Bucket not found.']);
 
-        $client = impulseminio_getClient($params);
+        $client = impulseminio_getServiceClient($params);
         $r = $client->getPresignedDownloadUrl($bucketName, $objectKey, 3600);
 
         return impulseminio_jsonResponse([
@@ -1581,7 +1746,7 @@ function impulseminio_clientGetUploadUrl(array $params): string
             ->where('service_id', $serviceId)->where('bucket_name', $bucketName)->first();
         if (!$bucket) return impulseminio_jsonResponse(['success' => false, 'error' => 'Bucket not found.']);
 
-        $client = impulseminio_getClient($params);
+        $client = impulseminio_getServiceClient($params);
         $r = $client->getPresignedUploadUrl($bucketName, $objectKey, 3600);
 
         return impulseminio_jsonResponse([
@@ -1614,7 +1779,7 @@ function impulseminio_clientDeleteObject(array $params): string
             ->where('service_id', $serviceId)->where('bucket_name', $bucketName)->first();
         if (!$bucket) return impulseminio_jsonResponse(['success' => false, 'error' => 'Bucket not found.']);
 
-        $client = impulseminio_getClient($params);
+        $client = impulseminio_getServiceClient($params);
         $r = $client->deleteObject($bucketName, $objectKey);
 
         return impulseminio_jsonResponse([
@@ -1649,7 +1814,7 @@ function impulseminio_clientCreateFolder(array $params): string
             ->where('service_id', $serviceId)->where('bucket_name', $bucketName)->first();
         if (!$bucket) return impulseminio_jsonResponse(['success' => false, 'error' => 'Bucket not found.']);
 
-        $client = impulseminio_getClient($params);
+        $client = impulseminio_getServiceClient($params);
         $r = $client->createFolder($bucketName, $folderPath);
 
         return impulseminio_jsonResponse([
@@ -1749,7 +1914,7 @@ function impulseminio_clientTogglePublic(array $params): string
             exit;
         }
         require_once __DIR__ . '/lib/PublicAccess.php';
-        $client = impulseminio_getClient($params);
+        $client = impulseminio_getServiceClient($params);
         if (\WHMCS\Module\Server\ImpulseMinio\PublicAccess::isPublic($serviceId, $bucketName)) {
             \WHMCS\Module\Server\ImpulseMinio\PublicAccess::disablePublic($client, $serviceId, $bucketName);
         } else {
@@ -1839,7 +2004,7 @@ function impulseminio_AdminCustomButtonArray(): array
 function impulseminio_checkUsage(array $params): string
 {
     try {
-        $client = impulseminio_getClient($params);
+        $client = impulseminio_getServiceClient($params);
         $buckets = impulseminio_getAllBuckets((int)$params['serviceid']) ?: [impulseminio_getBucket($params)];
         foreach ($buckets as $b) { $client->getBucketUsage($b); }
         return 'success';
@@ -1855,7 +2020,7 @@ function impulseminio_checkUsage(array $params): string
 function impulseminio_resetPassword(array $params): string
 {
     try {
-        $client = impulseminio_getClient($params);
+        $client = impulseminio_getServiceClient($params);
         $username = impulseminio_getUsername($params);
         $np = MinioClient::generatePassword(24);
         $r = $client->createUser($username, $np);
@@ -1892,7 +2057,7 @@ function impulseminio_rebuildPolicy(array $params): string
 function impulseminio_TestConnection(array $params): array
 {
     try {
-        $client = impulseminio_getClient($params);
+        $client = impulseminio_getServiceClient($params);
         $r = $client->testConnection();
         return ['success' => $r['success'], 'error' => $r['success'] ? '' : $r['message']];
     } catch (\Exception $e) { return ['success' => false, 'error' => $e->getMessage()]; }

@@ -1,8 +1,9 @@
 <?php
 /**
- * Impulse Hosting - MinIO Client Library v1.1
+ * Impulse Hosting - MinIO Client Library v1.2
  * Wraps MinIO mc CLI for the WHMCS provisioning module.
- * Supports multi-bucket policies and service account (access key) management.
+ * Supports multi-bucket policies, service account management,
+ * and multi-region connections via unique per-endpoint aliases.
  * @package ImpulseMinio
  */
 namespace WHMCS\Module\Server\ImpulseMinio;
@@ -24,7 +25,8 @@ class MinioClient
         $this->secretKey = $secretKey;
         $this->mcPath    = $mcPath;
         $this->useSSL    = $useSSL;
-        $this->mcAlias   = 'impulse';
+        // Unique alias per endpoint to support multi-region connections
+        $this->mcAlias   = 'impulse-' . substr(md5($this->endpoint), 0, 8);
     }
 
     private function mc(string $command, array $args = [], bool $jsonOutput = false): array
