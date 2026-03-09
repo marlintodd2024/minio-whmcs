@@ -2282,9 +2282,13 @@ function impulseminio_clientCreateReplicationJob(array $params): string
         ];
 
         $result = \WHMCS\Module\Server\ImpulseMinio\Replication::createJob(
-            $params, $serviceId, $srcBucket,
-            $srcRegionLink->region_id, $destRegionId,
-            $description, $options
+            $params,
+            $serviceId,
+            $srcBucket,
+            $srcRegionLink->region_id,
+            $destRegionId,
+            $description,
+            $options
         );
 
         return impulseminio_jsonResponse($result);
