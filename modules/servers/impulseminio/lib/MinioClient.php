@@ -508,33 +508,23 @@ class MinioClient
     // === REPLICATION ===
 
     /**
-     * Add a remote replication target.
+     * Add a remote replication target (deprecated — use addReplicationWithTarget).
+     * Kept for backward compatibility.
      *
      * @return array{success: bool, arn?: string, error?: string}
      */
     public function addRemoteTarget(string $srcBucket, string $destEndpoint, string $destBucket, string $accessKey, string $secretKey): array
     {
-        $this->ensureAlias();
-        $target = $destEndpoint . '/' . $destBucket;
-        $r = $this->mc('admin bucket remote add', [
-            $this->mcAlias . '/' . $srcBucket,
-            $target,
-            '--service', 'replication',
-            '--access-key', $accessKey,
-            '--secret-key', $secretKey,
-        ]);
-
-        if (!$r['success']) {
-            return ['success' => false, 'error' => $r['output']];
-        }
-
-        // Parse ARN from output
-        $arn = '';
-        if (preg_match('/arn:minio:replication:[^:\s]+/', $r['output'], $m)) {
-            $arn = $m[0];
-        }
-
-        return ['success' => true, 'arn' => $arn];
+        // New mc versions handle remote target creation inline via mc replicate add
+        // Store the target URL for use by addReplicationRule
+        return [
+            'success' => true,
+            'arn' => '',
+            'target_url' => $destEndpoint,
+            'dest_bucket' => $destBucket,
+            'access_key' => $accessKey,
+            'secret_key' => $secretKey,
+        ];
     }
 
     /**
@@ -542,22 +532,30 @@ class MinioClient
      */
     public function removeRemoteTarget(string $bucket, string $arn): array
     {
+        if (empty($arn)) return ['success' => true, 'output' => 'No ARN to remove'];
         $this->ensureAlias();
         $r = $this->mc('admin bucket remote rm', [$this->mcAlias . '/' . $bucket, '--arn', $arn]);
         return ['success' => $r['success'], 'output' => $r['output']];
     }
 
     /**
-     * Add a replication rule on a bucket.
+     * Add a replication rule with inline remote target (new mc syntax).
+     *
+     * Uses: mc replicate add ALIAS/BUCKET --remote-bucket https://USER:SECRET@ENDPOINT/DESTBUCKET --replicate FLAGS
      *
      * @return array{success: bool, rule_id?: string, error?: string}
      */
     public function addReplicationRule(string $bucket, string $remoteArn, string $replicateFlags = 'delete,delete-marker,existing-objects'): array
     {
         $this->ensureAlias();
+
+        // If remoteArn is a URL (new style), use it directly
+        // If it's an actual ARN (old style), use that
+        $remoteBucket = $remoteArn;
+
         $r = $this->mc('replicate add', [
             $this->mcAlias . '/' . $bucket,
-            '--remote-bucket', $remoteArn,
+            '--remote-bucket', $remoteBucket,
             '--replicate', $replicateFlags,
         ], true);
 
@@ -566,6 +564,51 @@ class MinioClient
         }
 
         // Parse rule ID from JSON output
+        $ruleId = '';
+        $lines = explode("\n", trim($r['output']));
+        foreach ($lines as $line) {
+            $json = @json_decode($line, true);
+            if (isset($json['id'])) {
+                $ruleId = $json['id'];
+                break;
+            }
+        }
+
+        return ['success' => true, 'rule_id' => $ruleId];
+    }
+
+    /**
+     * Create replication with remote target in one step.
+     *
+     * @return array{success: bool, rule_id?: string, error?: string}
+     */
+    public function addReplicationWithTarget(
+        string $srcBucket,
+        string $destEndpoint,
+        string $destBucket,
+        string $accessKey,
+        string $secretKey,
+        string $replicateFlags = 'delete,delete-marker,existing-objects'
+    ): array {
+        $this->ensureAlias();
+
+        // Build target URL: https://USER:SECRET@ENDPOINT/BUCKET
+        $parsed = parse_url($destEndpoint);
+        $scheme = $parsed['scheme'] ?? 'https';
+        $host = $parsed['host'] ?? '';
+        $port = isset($parsed['port']) ? ':' . $parsed['port'] : '';
+        $targetUrl = $scheme . '://' . $accessKey . ':' . $secretKey . '@' . $host . $port . '/' . $destBucket;
+
+        $r = $this->mc('replicate add', [
+            $this->mcAlias . '/' . $srcBucket,
+            '--remote-bucket', $targetUrl,
+            '--replicate', $replicateFlags,
+        ], true);
+
+        if (!$r['success']) {
+            return ['success' => false, 'error' => $r['output']];
+        }
+
         $ruleId = '';
         $lines = explode("\n", trim($r['output']));
         foreach ($lines as $line) {

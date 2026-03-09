@@ -238,28 +238,46 @@ function impulseminio_addon_output(array $vars): void
 
     // === LICENSE TAB ===
     if ($tab === 'license') {
-        // Validate license if key exists
         $licenseKey = $settings['premium_license_key'];
-        $licenseStatus = null;
-        $licenseTier = '—';
-        $licenseExpiry = '—';
+        $licenseStatus = 'none';
+        $licenseTier = '';
+        $licenseFeatures = [];
         $licenseMessage = '';
 
         if (!empty($licenseKey)) {
-            // Call WHMCS Software Licensing API to validate
-            try {
-                $licenseCheck = localAPI('GetClientsProducts', [], null);
-                // For now, do a basic check — Premium.php handles the full validation
-                // We just display the key and let the user know if it's set
-                $licenseStatus = 'configured';
-                $licenseMessage = 'License key is configured. The server module validates the key on each request via the WHMCS Software Licensing addon.';
-
-                // Try to detect tier from key pattern or stored setting
-                $tierSetting = impulseminio_getSetting('premium_tier', '');
-                if (!empty($tierSetting)) $licenseTier = ucfirst($tierSetting);
-            } catch (\Exception $e) {
-                $licenseStatus = 'error';
-                $licenseMessage = 'Could not validate license: ' . $e->getMessage();
+            // Use Premium.php for real validation if available
+            $premiumFile = dirname(dirname(__DIR__)) . '/servers/impulseminio/lib/Premium.php';
+            if (file_exists($premiumFile)) {
+                require_once $premiumFile;
+                try {
+                    \WHMCS\Module\Server\ImpulseMinio\Premium::clearCache();
+                    $result = \WHMCS\Module\Server\ImpulseMinio\Premium::validate();
+                    if (($result['status'] ?? '') === 'Active') {
+                        $licenseStatus = 'active';
+                        $licenseTier = \WHMCS\Module\Server\ImpulseMinio\Premium::getTier();
+                        $allFeatures = [
+                            'public_access' => 'Public Bucket Access (CDN)',
+                            'cors' => 'CORS Configuration',
+                            'replication' => 'Multi-Region Replication',
+                            'migration' => 'Cloud Data Migration',
+                            'custom_domain' => 'Custom Domains',
+                        ];
+                        $tierFeatures = \WHMCS\Module\Server\ImpulseMinio\Premium::TIERS[$licenseTier] ?? [];
+                        foreach ($allFeatures as $fKey => $fLabel) {
+                            $licenseFeatures[$fLabel] = in_array($fKey, $tierFeatures);
+                        }
+                        $licenseMessage = 'License validated successfully. Last check: ' . ($result['checkdate'] ?? 'N/A');
+                    } else {
+                        $licenseStatus = 'invalid';
+                        $licenseMessage = 'License validation failed: ' . ($result['description'] ?? $result['status'] ?? 'Unknown error');
+                    }
+                } catch (\Exception $e) {
+                    $licenseStatus = 'error';
+                    $licenseMessage = 'Validation error: ' . $e->getMessage();
+                }
+            } else {
+                $licenseStatus = 'missing';
+                $licenseMessage = 'Premium module files not installed. Upload Premium.php to modules/servers/impulseminio/lib/';
             }
         }
 
@@ -268,32 +286,71 @@ function impulseminio_addon_output(array $vars): void
 
         // License status card
         if (!empty($licenseKey)) {
-            $statusColor = $licenseStatus === 'configured' ? '#28a745' : '#dc3545';
-            $statusLabel = $licenseStatus === 'configured' ? 'Configured' : 'Error';
+            $statusColors = ['active' => '#28a745', 'invalid' => '#dc3545', 'error' => '#dc3545', 'missing' => '#ffc107'];
+            $statusLabels = ['active' => 'Active', 'invalid' => 'Invalid', 'error' => 'Error', 'missing' => 'Files Missing'];
+            $sc = $statusColors[$licenseStatus] ?? '#999';
+            $sl = $statusLabels[$licenseStatus] ?? 'Unknown';
+
             echo '<div style="background:#f8f9fa;border:1px solid #e9ecef;border-radius:6px;padding:16px;margin-bottom:16px;">';
             echo '<div style="display:flex;align-items:center;gap:12px;margin-bottom:8px;">';
-            echo '<span style="display:inline-block;width:10px;height:10px;border-radius:50%;background:'.$statusColor.';"></span>';
-            echo '<strong style="font-size:15px;">License Status: '.$statusLabel.'</strong>';
+            echo '<span style="display:inline-block;width:12px;height:12px;border-radius:50%;background:'.$sc.';"></span>';
+            echo '<strong style="font-size:15px;">License Status: '.$sl.'</strong>';
+            if (!empty($licenseTier)) {
+                $tierNames = ['static' => 'Static Hosting', 'replication' => 'Static + Replication', 'everything' => 'Everything'];
+                echo ' <span class="im-badge im-ok" style="margin-left:8px;">'.($tierNames[$licenseTier] ?? ucfirst($licenseTier)).'</span>';
+            }
             echo '</div>';
             echo '<div style="font-size:13px;color:#555;">'.$esc($licenseMessage).'</div>';
+
+            // Feature checklist
+            if (!empty($licenseFeatures)) {
+                echo '<div style="margin-top:12px;display:grid;grid-template-columns:1fr 1fr;gap:4px;">';
+                foreach ($licenseFeatures as $fLabel => $fEnabled) {
+                    $icon = $fEnabled ? '<span style="color:#28a745;">&#10004;</span>' : '<span style="color:#ccc;">&#10008;</span>';
+                    $style = $fEnabled ? '' : 'color:#999;';
+                    echo '<div style="padding:3px 0;font-size:13px;'.$style.'">'.$icon.' '.$esc($fLabel).'</div>';
+                }
+                echo '</div>';
+            }
+
+            // Upgrade prompt
+            if ($licenseStatus === 'active' && $licenseTier !== 'everything') {
+                $upgradeText = $licenseTier === 'static' ? 'Upgrade to unlock Replication & Custom Domains' : 'Upgrade to unlock Custom Domains & Migration';
+                echo '<div style="margin-top:12px;padding:10px;background:#fff3cd;border:1px solid #ffc107;border-radius:4px;font-size:13px;">';
+                echo '<i class="fas fa-arrow-up" style="color:#856404;"></i> '.$esc($upgradeText).'. ';
+                echo '<a href="https://impulsehosting.com/store/impulseminio-premium" target="_blank" style="font-weight:600;">Upgrade License</a>';
+                echo '</div>';
+            }
+
+            echo '</div>';
+        } else {
+            // No license — purchase prompt
+            echo '<div style="background:#f8f9fa;border:1px solid #e9ecef;border-radius:6px;padding:20px;margin-bottom:16px;text-align:center;">';
+            echo '<i class="fas fa-lock" style="font-size:28px;color:#999;display:block;margin-bottom:8px;"></i>';
+            echo '<p style="font-size:14px;color:#555;margin-bottom:12px;">No premium license configured. Unlock CDN, replication, and custom domains.</p>';
+            echo '<a href="https://impulsehosting.com/store/impulseminio-premium" target="_blank" class="im-btn im-btn-s">Purchase License</a>';
             echo '</div>';
         }
 
         echo '<div class="im-fg"><label>Premium License Key</label>';
-        echo '<input type="text" name="premium_license_key" value="'.$esc($licenseKey).'" placeholder="Enter your ImpulseMinio Premium license key" style="font-family:monospace;">';
-        echo '<div class="im-help">Purchase a license at impulsehosting.com. Unlocks public access (CDN), replication, migration, and custom domains based on tier.</div></div>';
+        echo '<input type="text" name="premium_license_key" value="'.$esc($licenseKey).'" placeholder="IMINIO-EV-XXXX-XXXX-XXXX" style="font-family:monospace;">';
+        echo '<div class="im-help">Enter your ImpulseMinio Premium license key. Tier is determined by the associated product on the licensing server.</div></div>';
 
-        // Tier info table
+        // Tier comparison
         echo '<div style="margin-top:16px;">';
-        echo '<table class="im-tbl"><tr><th>Tier</th><th>Price</th><th>Features</th></tr>';
-        echo '<tr><td><strong>Static Hosting</strong></td><td>$99/yr</td><td>Public bucket access (CDN), static site hosting</td></tr>';
-        echo '<tr><td><strong>Static + Replication</strong></td><td>$199/yr</td><td>All Static features + multi-region bucket replication</td></tr>';
-        echo '<tr><td><strong>Everything</strong></td><td>$249/yr</td><td>All features: CDN, replication, migration, custom domains</td></tr>';
-        echo '</table>';
-        echo '</div>';
+        echo '<h4 style="margin:0 0 10px;font-size:14px;">License Tiers</h4>';
+        echo '<table class="im-tbl"><tr><th>Tier</th><th>Price</th><th>Features</th><th></th></tr>';
+        $currentBadge = ' <span class="im-badge im-ok">Current</span>';
+        echo '<tr><td><strong>Static Hosting</strong></td><td>$99/yr</td><td>Public bucket access (CDN), CORS, static site hosting</td>';
+        echo '<td>'.($licenseTier === 'static' ? $currentBadge : '').'</td></tr>';
+        echo '<tr><td><strong>Static + Replication</strong></td><td>$199/yr</td><td>All Static + multi-region bucket replication</td>';
+        echo '<td>'.($licenseTier === 'replication' ? $currentBadge : '').'</td></tr>';
+        echo '<tr><td><strong>Everything</strong></td><td>$249/yr</td><td>All features: CDN, replication, migration, custom domains</td>';
+        echo '<td>'.($licenseTier === 'everything' ? $currentBadge : '').'</td></tr>';
+        echo '</table></div>';
 
         echo '</div></div>';
-        echo '<button type="submit" class="im-btn im-btn-p">Save License Key</button></form>';
+        echo '<button type="submit" class="im-btn im-btn-p"><i class="fas fa-save"></i> Save License Key</button></form>';
     }
 
     // === REGIONS TAB ===
