@@ -393,6 +393,54 @@ function impulseminio_getServiceClient(array $params): MinioClient
 }
 
 /**
+ * Get a MinioClient for a request — handles optional region_server_id for replica bucket browsing.
+ * If region_server_id is provided in POST, connects to that server instead of the primary.
+ *
+ * @param  array $params WHMCS module parameters
+ * @return MinioClient
+ */
+function impulseminio_getRequestClient(array $params): MinioClient
+{
+    $regionServerId = isset($_POST['region_server_id']) ? (int)$_POST['region_server_id'] : 0;
+    if ($regionServerId > 0) {
+        // Verify the server belongs to a region this service has access to
+        $serviceId = (int)$params['serviceid'];
+        $hasAccess = Capsule::table('mod_impulseminio_service_regions as sr')
+            ->join('mod_impulseminio_regions as r', 'sr.region_id', '=', 'r.id')
+            ->where('sr.service_id', $serviceId)
+            ->where('r.server_id', $regionServerId)
+            ->exists();
+        if ($hasAccess) {
+            return impulseminio_getClientForServer($regionServerId, $params);
+        }
+    }
+    return impulseminio_getServiceClient($params);
+}
+
+/**
+ * Validate bucket ownership — checks primary buckets AND replica destination buckets.
+ *
+ * @param  int    $serviceId
+ * @param  string $bucketName
+ * @return bool
+ */
+function impulseminio_validateBucketAccess(int $serviceId, string $bucketName): bool
+{
+    // Check primary buckets
+    if (Capsule::table('mod_impulseminio_buckets')
+        ->where('service_id', $serviceId)->where('bucket_name', $bucketName)->exists()) {
+        return true;
+    }
+    // Check replica destination buckets
+    if (Capsule::table('mod_impulseminio_replication_jobs')
+        ->where('service_id', $serviceId)->where('dest_bucket', $bucketName)
+        ->whereNotIn('status', ['removing', 'deleted'])->exists()) {
+        return true;
+    }
+    return false;
+}
+
+/**
  * Derive the MinIO username for a service.
  *
  * Format: {prefix}-{serviceid}-{clientname} (lowercased, sanitised)
@@ -465,34 +513,6 @@ function impulseminio_rebuildFullPolicy(array $params): array
  * @param  array  $params WHMCS module parameters
  * @return string "success" or error message
  */
-/**
- * Derive a human-readable region label from an S3 endpoint URL.
- *
- * Maps known ImpulseDrive region slugs to display names.
- * Falls back to the bare hostname if no match found.
- *
- * @param  string $endpoint  S3 endpoint URL (e.g. https://us-central-dallas.impulsedrive.io)
- * @return string            Display label (e.g. "US Central — Dallas")
- */
-function impulseminio_regionLabel(string $endpoint): string
-{
-    static $map = [
-        'us-central-dallas'     => 'US Central — Dallas',
-        'us-east-newark'        => 'US East — Newark',
-        'eu-west-london'        => 'EU West — London',
-        'ap-southeast-singapore' => 'AP Southeast — Singapore',
-    ];
-
-    $host = strtolower(parse_url($endpoint, PHP_URL_HOST) ?: $endpoint);
-    foreach ($map as $slug => $label) {
-        if (strpos($host, $slug) !== false) {
-            return $label;
-        }
-    }
-    // Fallback: return bare hostname so domain field is never blank
-    return $host;
-}
-
 function impulseminio_CreateAccount(array $params): string
 {
     try {
@@ -601,7 +621,6 @@ function impulseminio_CreateAccount(array $params): string
         ]);
         Capsule::table('tblhosting')->where('id', $params['serviceid'])->update([
             'username' => $username, 'password' => encrypt($password),
-            'domain'   => impulseminio_regionLabel($s3Endpoint),
             'diskusage' => 0,
             'disklimit' => $quotaGB > 0 ? $quotaGB * 1024 : 0,
             'bwusage' => 0,
@@ -762,24 +781,72 @@ function impulseminio_UsageUpdate(array $params): void
     $serverId = $params['serverid'];
     $services = Capsule::table('tblhosting')->where('server', $serverId)->where('domainstatus', 'Active')->get();
     if ($services->isEmpty()) return;
-    $client = impulseminio_getServiceClient($params);
 
     foreach ($services as $service) {
         try {
-            $buckets = impulseminio_getAllBuckets($service->id);
-            if (empty($buckets)) {
-                $bn = Capsule::table('tblcustomfieldsvalues')->join('tblcustomfields','tblcustomfields.id','=','tblcustomfieldsvalues.fieldid')
-                    ->where('tblcustomfields.fieldname','Bucket Name')->where('tblcustomfieldsvalues.relid',$service->id)->value('tblcustomfieldsvalues.value');
-                if ($bn) $buckets = [$bn];
-            }
-            if (empty($buckets)) continue;
+            $totalDiskBytes = 0;
+            $totalBwRx = 0;
+            $totalBwTx = 0;
 
-            $totalDiskBytes = 0; $totalBwRx = 0; $totalBwTx = 0;
-            foreach ($buckets as $b) {
-                $du = $client->getBucketUsage($b);
-                $totalDiskBytes += $du['sizeBytes'];
-                $bw = $client->getBucketBandwidth($b);
-                $totalBwRx += $bw['bytesReceived']; $totalBwTx += $bw['bytesSent'];
+            // Get all regions this service has (primary + replication destinations)
+            $serviceRegions = [];
+            try {
+                $serviceRegions = Capsule::table('mod_impulseminio_service_regions as sr')
+                    ->join('mod_impulseminio_regions as r', 'sr.region_id', '=', 'r.id')
+                    ->where('sr.service_id', $service->id)
+                    ->select('r.server_id', 'sr.is_primary')
+                    ->get()->toArray();
+            } catch (\Exception $e) {
+                // Table may not exist — fall back to single-region
+            }
+
+            if (empty($serviceRegions)) {
+                // Legacy: single region, use the product's assigned server
+                $serviceRegions = [(object)['server_id' => $serverId, 'is_primary' => true]];
+            }
+
+            foreach ($serviceRegions as $sr) {
+                try {
+                    $regionClient = impulseminio_getClientForServer((int)$sr->server_id, $params);
+
+                    // Get buckets on this region
+                    $regionBuckets = [];
+                    if ($sr->is_primary) {
+                        $regionBuckets = impulseminio_getAllBuckets($service->id);
+                        if (empty($regionBuckets)) {
+                            $bn = Capsule::table('tblcustomfieldsvalues')
+                                ->join('tblcustomfields', 'tblcustomfields.id', '=', 'tblcustomfieldsvalues.fieldid')
+                                ->where('tblcustomfields.fieldname', 'Bucket Name')
+                                ->where('tblcustomfieldsvalues.relid', $service->id)
+                                ->value('tblcustomfieldsvalues.value');
+                            if ($bn) $regionBuckets = [$bn];
+                        }
+                    } else {
+                        // Replication destination: get dest_bucket from replication jobs
+                        $regionBuckets = Capsule::table('mod_impulseminio_replication_jobs')
+                            ->where('service_id', $service->id)
+                            ->join('mod_impulseminio_regions as r', 'mod_impulseminio_replication_jobs.dest_region_id', '=', 'r.id')
+                            ->where('r.server_id', $sr->server_id)
+                            ->whereNotIn('mod_impulseminio_replication_jobs.status', ['removing', 'deleted'])
+                            ->pluck('mod_impulseminio_replication_jobs.dest_bucket')
+                            ->toArray();
+                    }
+
+                    foreach ($regionBuckets as $b) {
+                        $du = $regionClient->getBucketUsage($b);
+                        $totalDiskBytes += $du['sizeBytes'];
+                        $bw = $regionClient->getBucketBandwidth($b);
+                        $totalBwRx += $bw['bytesReceived'];
+                        $totalBwTx += $bw['bytesSent'];
+                    }
+                } catch (\Exception $e) {
+                    logModuleCall(
+                        'impulseminio',
+                        'UsageUpdate:region',
+                        ['serviceId' => $service->id, 'serverId' => $sr->server_id],
+                        $e->getMessage()
+                    );
+                }
             }
 
             $product = Capsule::table('tblproducts')->where('id', $service->packageid)->first();
@@ -787,9 +854,9 @@ function impulseminio_UsageUpdate(array $params): void
             $bwLimitGB = (int)($product->configoption2 ?? 0);
 
             Capsule::table('tblhosting')->where('id', $service->id)->update([
-                'diskusage' => round($totalDiskBytes / (1024*1024), 2),
+                'diskusage' => round($totalDiskBytes / (1024 * 1024), 2),
                 'disklimit' => $diskLimitGB * 1024,
-                'bwusage' => round(($totalBwRx + $totalBwTx) / (1024*1024), 2),
+                'bwusage' => round(($totalBwRx + $totalBwTx) / (1024 * 1024), 2),
                 'bwlimit' => $bwLimitGB * 1024,
                 'lastupdate' => Capsule::raw('NOW()'),
             ]);
@@ -915,6 +982,58 @@ function impulseminio_renderClientArea(array $params = []): string
         ->where('service_id', $serviceId)->orderBy('is_primary', 'desc')->orderBy('created_at')->get();
     $bucketCount = count($buckets);
     $defaultBucket = $bucketCount > 0 ? $esc($buckets[0]->bucket_name) : '';
+
+    // Load replica buckets from replication jobs
+    $replicaBuckets = [];
+    $replJobs = [];
+    try {
+        $replJobs = Capsule::table('mod_impulseminio_replication_jobs as j')
+            ->leftJoin('mod_impulseminio_regions as sr', 'j.source_region_id', '=', 'sr.id')
+            ->leftJoin('mod_impulseminio_regions as dr', 'j.dest_region_id', '=', 'dr.id')
+            ->where('j.service_id', $serviceId)
+            ->whereNotIn('j.status', ['removing', 'deleted'])
+            ->select('j.*', 'sr.name as src_region_name', 'sr.cdn_endpoint as src_cdn',
+                'dr.name as dest_region_name', 'dr.cdn_endpoint as dest_cdn',
+                'dr.server_id as dest_server_id')
+            ->get()->toArray();
+        foreach ($replJobs as $rj) {
+            $replicaBuckets[] = (object)[
+                'bucket_name' => $rj->dest_bucket,
+                'label' => $rj->description ?: 'Replica',
+                'is_primary' => false,
+                'is_replica' => true,
+                'region_name' => $rj->dest_region_name,
+                'region_cdn' => $rj->dest_cdn,
+                'source_bucket' => $rj->source_bucket,
+                'source_region' => $rj->src_region_name,
+                'server_id' => $rj->dest_server_id,
+                'job_status' => $rj->status,
+                'created_at' => $rj->created_at,
+            ];
+        }
+    } catch (\Exception $e) {}
+
+    // Get primary region info
+    $primaryRegion = null;
+    try {
+        $prLink = Capsule::table('mod_impulseminio_service_regions')
+            ->where('service_id', $serviceId)->where('is_primary', true)->first();
+        if ($prLink) {
+            $primaryRegion = Capsule::table('mod_impulseminio_regions')
+                ->where('id', $prLink->region_id)->first();
+        }
+    } catch (\Exception $e) {}
+    $primaryRegionName = $primaryRegion ? $primaryRegion->name : '';
+    $primaryCdn = $primaryRegion ? ($primaryRegion->cdn_endpoint ?: '') : '';
+
+    // Build a map of bucket_name => server_id for file browser region routing
+    $bucketServerMap = [];
+    foreach ($buckets as $b) {
+        $bucketServerMap[$b->bucket_name] = $primaryRegion ? (int)$primaryRegion->server_id : 0;
+    }
+    foreach ($replicaBuckets as $rb) {
+        $bucketServerMap[$rb->bucket_name . ':replica:' . $rb->server_id] = (int)$rb->server_id;
+    }
 
     $accessKeys = Capsule::table('mod_impulseminio_accesskeys')
         ->where('service_id', $serviceId)->orderBy('created_at')->get();
@@ -1043,8 +1162,10 @@ function impulseminio_renderClientArea(array $params = []): string
     $mbDisplay = $maxBuckets > 0 ? $maxBuckets : 'Unlimited';
     $o .= '<div class="panel panel-default"><div class="panel-heading"><h3 class="panel-title"><i class="fas fa-archive"></i> Your Buckets <span class="pull-right" style="font-size:13px;font-weight:normal;">' . $bucketCount . ' / ' . $mbDisplay . '</span></h3></div>';
     $o .= '<div class="panel-body">';
+    $regionCol = (!empty($primaryRegionName) || !empty($replicaBuckets)) ? '<th>Region</th>' : '';
     $versioningHeader = $versioningAllowed ? '<th>Versioning</th>' : '';
-    $o .= '<table class="table table-striped table-hover"><thead><tr><th>Bucket Name</th><th>Label</th>' . $versioningHeader . (impulseminio_hasPublicAccess() ? '<th style="width:100px;">Public</th>' : '') . '<th>Created</th><th></th></tr></thead><tbody>';
+    $o .= '<table class="table table-striped table-hover"><thead><tr><th>Bucket Name</th><th>Label</th>' . $regionCol . $versioningHeader . (impulseminio_hasPublicAccess() ? '<th style="width:100px;">Public</th>' : '') . '<th>Created</th><th></th></tr></thead><tbody>';
+    // Primary buckets
     foreach ($buckets as $b) {
         $bn = $esc($b->bucket_name);
         $bl = $esc($b->label ?: '-');
@@ -1078,9 +1199,14 @@ function impulseminio_renderClientArea(array $params = []): string
             $title = $isOn ? 'Click to suspend versioning' : 'Click to enable versioning';
             $versioningCell = '<td><button class="btn btn-xs ' . $btnClass . '" onclick="toggleVersioning(\'' . $bn . '\')" title="' . $title . '"><i class="fas ' . $icon . '"></i> ' . $label . '</button></td>';
         }
-        $o .= '<tr><td><code>' . $bn . '</code>' . $primary . '</td><td>' . $bl . '</td>' . $versioningCell . $publicCell . '<td>' . $bc . '</td><td>' . $del . '</td></tr>';
+        $regionCell = '';
+        if (!empty($regionCol)) {
+            $regionCell = '<td><span style="font-size:12px;">' . $esc($primaryRegionName) . '</span></td>';
+        }
+        $o .= '<tr><td><code>' . $bn . '</code>' . $primary . '</td><td>' . $bl . '</td>' . $regionCell . $versioningCell . $publicCell . '<td>' . $bc . '</td><td>' . $del . '</td></tr>';
         if (!empty($corsBtn)) {
-            $o .= '<tr id="cors-panel-' . $bn . '" style="display:none;"><td colspan="6" style="background:#f8f9fa;padding:15px;">';
+            $colSpan = 5 + (!empty($regionCol) ? 1 : 0) + ($versioningAllowed ? 1 : 0) + (impulseminio_hasPublicAccess() ? 1 : 0);
+            $o .= '<tr id="cors-panel-' . $bn . '" style="display:none;"><td colspan="' . $colSpan . '" style="background:#f8f9fa;padding:15px;">';
             $o .= '<div style="max-width:500px;"><label style="font-weight:600;font-size:13px;margin-bottom:8px;"><i class="fas fa-globe"></i> Allowed CORS Origins</label>';
             $o .= '<textarea id="cors-origins-' . $bn . '" class="form-control input-sm" rows="4" style="font-family:monospace;font-size:12px;margin-bottom:8px;" placeholder="*&#10;https://example.com&#10;https://app.example.com">' . $corsValue . '</textarea>';
             $o .= '<div class="text-muted" style="font-size:11px;margin-bottom:10px;">';
@@ -1096,6 +1222,16 @@ function impulseminio_renderClientArea(array $params = []): string
             $o .= '<button class="btn btn-primary btn-xs" onclick="saveCors(\'' . $bn . '\')"><i class="fas fa-save"></i> Save CORS</button>';
             $o .= '</div></div></td></tr>';
         }
+    }
+    // Replica buckets
+    foreach ($replicaBuckets as $rb) {
+        $bn = $esc($rb->bucket_name);
+        $statusBadge = $rb->job_status === 'active' ? '<span class="label label-info">Replica</span>' : '<span class="label label-warning">Replica (' . $esc($rb->job_status) . ')</span>';
+        $regionCell = '<td><span style="font-size:12px;">' . $esc($rb->region_name) . '</span></td>';
+        $vCell = $versioningAllowed ? '<td><span class="text-muted" style="font-size:11px;">Auto</span></td>' : '';
+        $pubCell = impulseminio_hasPublicAccess() ? '<td style="text-align:center;"><span class="text-muted" style="font-size:11px;">—</span></td>' : '';
+        $emptyColCount = 1; // actions column
+        $o .= '<tr style="background:#f8f9fa;"><td><code>' . $bn . '</code> ' . $statusBadge . '</td><td>' . $esc($rb->label) . '</td>' . $regionCell . $vCell . $pubCell . '<td style="font-size:12px;">' . $esc($rb->created_at) . '</td><td><span class="text-muted" style="font-size:11px;">Read Only</span></td></tr>';
     }
     $o .= '</tbody></table>';
     if ($maxBuckets == 0 || $bucketCount < $maxBuckets) {
@@ -1171,15 +1307,37 @@ function impulseminio_renderClientArea(array $params = []): string
 
     // Toolbar: bucket select + breadcrumb + actions
     $o .= '<div class="fb-toolbar" style="display:flex;align-items:center;gap:10px;margin-bottom:15px;flex-wrap:wrap;">';
-    $o .= '<select id="fb-bucket" class="form-control input-sm" style="width:auto;min-width:180px;" onchange="fbNavigate(this.value,\'\')">';
+    $o .= '<select id="fb-bucket" class="form-control input-sm" style="width:auto;min-width:220px;" onchange="fbBucketChanged(this)">';
+    // Primary buckets
+    if (!empty($primaryRegionName) && !empty($replicaBuckets)) {
+        $o .= '<optgroup label="' . $esc($primaryRegionName) . ' (Primary)">';
+    }
     foreach ($buckets as $b) {
         $sel = ($b->bucket_name === ($buckets[0]->bucket_name ?? '')) ? ' selected' : '';
-        $o .= '<option value="' . $esc($b->bucket_name) . '"' . $sel . '>' . $esc($b->label ?: $b->bucket_name) . '</option>';
+        $o .= '<option value="' . $esc($b->bucket_name) . '" data-readonly="0"' . $sel . '>' . $esc($b->label ?: $b->bucket_name) . '</option>';
+    }
+    if (!empty($primaryRegionName) && !empty($replicaBuckets)) {
+        $o .= '</optgroup>';
+    }
+    // Replica buckets
+    if (!empty($replicaBuckets)) {
+        $seenReplRegions = [];
+        foreach ($replicaBuckets as $rb) {
+            if (!in_array($rb->region_name, $seenReplRegions)) {
+                if (!empty($seenReplRegions)) $o .= '</optgroup>';
+                $o .= '<optgroup label="' . $esc($rb->region_name) . ' (Replica)">';
+                $seenReplRegions[] = $rb->region_name;
+            }
+            $o .= '<option value="' . $esc($rb->bucket_name) . '" data-readonly="1" data-server="' . (int)$rb->server_id . '">' . $esc($rb->bucket_name) . ' [Read Only]</option>';
+        }
+        $o .= '</optgroup>';
     }
     $o .= '</select>';
     $o .= '<nav id="fb-breadcrumb" style="flex:1;font-size:13px;"><a href="#" onclick="fbNavigate(null,\'\');return false;" style="font-weight:600;"><i class="fas fa-home"></i></a></nav>';
-    $o .= '<button class="btn btn-success btn-sm" onclick="fbShowUpload()" title="Upload files"><i class="fas fa-upload"></i> Upload</button>';
-    $o .= '<button class="btn btn-default btn-sm" onclick="fbCreateFolder()" title="New folder"><i class="fas fa-folder-plus"></i> New Folder</button><button class="btn btn-default btn-sm" onclick="document.getElementById(&quot;fb-folder-input&quot;).click()" title="Upload folder"><i class="fas fa-folder-open"></i> Upload Folder</button>';
+    $o .= '<span id="fb-readonly-badge" style="display:none;"><span class="label label-default" style="font-size:11px;"><i class="fas fa-lock"></i> Read Only</span></span>';
+    $o .= '<button class="btn btn-success btn-sm" id="fb-upload-btn" onclick="fbShowUpload()" title="Upload files"><i class="fas fa-upload"></i> Upload</button>';
+    $o .= '<button class="btn btn-success btn-sm" id="fb-folder-upload-btn" onclick="document.getElementById(\'fb-folder-input\').click()" title="Upload folder"><i class="fas fa-folder"></i> Upload Folder</button>';
+    $o .= '<button class="btn btn-default btn-sm" id="fb-newfolder-btn" onclick="fbCreateFolder()" title="New folder"><i class="fas fa-folder-plus"></i> New Folder</button>';
     $o .= '<button class="btn btn-default btn-sm" onclick="fbRefresh()" title="Refresh"><i class="fas fa-sync-alt"></i></button>';
     $o .= '</div>';
 
@@ -1187,7 +1345,8 @@ function impulseminio_renderClientArea(array $params = []): string
     $o .= '<div id="fb-upload-zone" style="display:none;margin-bottom:15px;padding:30px;border:2px dashed #ccc;border-radius:8px;text-align:center;background:#fafafa;cursor:pointer;" onclick="document.getElementById(\'fb-upload-input\').click()" ondrop="fbHandleDrop(event)" ondragover="event.preventDefault();this.style.borderColor=\'#1a1a2e\';this.style.background=\'#f0f0ff\'" ondragleave="this.style.borderColor=\'#ccc\';this.style.background=\'#fafafa\'">';
     $o .= '<i class="fas fa-cloud-upload-alt" style="font-size:32px;color:#999;margin-bottom:8px;display:block;"></i>';
     $o .= '<p style="margin:0;color:#666;">Drag and drop files here, or click to select</p>';
-    $o .= '<input type="file" id="fb-upload-input" multiple style="display:none;" onchange="fbUploadFiles(this.files)"><input type="file" id="fb-folder-input" webkitdirectory style="display:none;" onchange="fbUploadFolder(this.files)">';
+    $o .= '<input type="file" id="fb-upload-input" multiple style="display:none;" onchange="fbUploadFiles(this.files)">';
+    $o .= '<input type="file" id="fb-folder-input" webkitdirectory multiple style="display:none;" onchange="fbUploadFiles(this.files,true)">';
     $o .= '<div id="fb-upload-progress" style="margin-top:10px;"></div>';
     $o .= '</div>';
 
@@ -1298,7 +1457,65 @@ function impulseminio_renderClientArea(array $params = []): string
         $o .= ' <button class="btn btn-default" onclick="replHideCreate()">Cancel</button>';
         $o .= '</div>'; // create form
 
-        $o .= '</div></div></div>'; // panel
+        $o .= '</div></div>'; // close panel-body and panel
+
+        // Replication Endpoints panel (inside tab-replication)
+        if (!empty($replJobs)) {
+            $o .= '<div class="panel panel-default" style="margin-top:15px;"><div class="panel-heading"><h3 class="panel-title"><i class="fas fa-link"></i> Replication Endpoints</h3></div>';
+            $o .= '<div class="panel-body">';
+            $o .= '<p style="font-size:13px;color:#666;margin-bottom:12px;">Use the <strong>Primary</strong> endpoint for uploads and writes. <strong>Replica</strong> endpoints serve read-only copies for low-latency access or disaster recovery.</p>';
+            $o .= '<table class="table table-bordered" style="font-size:13px;"><thead><tr><th></th><th>Region</th><th>S3 Endpoint</th><th>CDN / Custom Domain</th><th>Access</th></tr></thead><tbody>';
+
+            // Primary region
+            $primaryS3 = $s3Endpoint ?: ($primaryCdn ?: '—');
+            // Check for custom domain on primary
+            $primaryCustomDomain = '';
+            try {
+                $pubBucket = Capsule::table('mod_impulseminio_public_buckets')
+                    ->where('service_id', $serviceId)
+                    ->whereNotNull('custom_domain')
+                    ->where('custom_domain', '!=', '')
+                    ->first();
+                if ($pubBucket) $primaryCustomDomain = $pubBucket->custom_domain;
+            } catch (\Exception $e) {}
+
+            $primaryCdnDisplay = '';
+            if (!empty($primaryCustomDomain)) {
+                $primaryCdnDisplay = 'https://' . $esc($primaryCustomDomain);
+            } elseif (!empty($primaryCdn) && !empty($defaultBucket)) {
+                $primaryCdnDisplay = 'https://' . $esc($defaultBucket) . '.' . str_replace('https://', '', $esc($primaryCdn));
+            }
+
+            $o .= '<tr>';
+            $o .= '<td><span class="label label-primary">Primary</span></td>';
+            $o .= '<td>' . $esc($primaryRegionName) . '</td>';
+            $o .= '<td><code style="font-size:11px;">' . $esc($primaryS3) . '</code> <button class="btn btn-xs btn-default" onclick="navigator.clipboard.writeText(\'' . $esc($primaryS3) . '\');this.innerHTML=\'<i class=\\\'fas fa-check\\\'></i>\';var b=this;setTimeout(function(){b.innerHTML=\'<i class=\\\'fas fa-copy\\\'></i>\';},1000);" title="Copy"><i class="fas fa-copy"></i></button></td>';
+            $o .= '<td>' . (!empty($primaryCdnDisplay) ? '<code style="font-size:11px;">' . $esc($primaryCdnDisplay) . '</code>' : '<span class="text-muted">—</span>') . '</td>';
+            $o .= '<td><span class="label label-success">Read / Write</span></td>';
+            $o .= '</tr>';
+
+            // Replica regions (deduplicated)
+            $seenRegions = [];
+            foreach ($replJobs as $rj) {
+                if (in_array($rj->dest_region_id, $seenRegions)) continue;
+                $seenRegions[] = $rj->dest_region_id;
+                $destS3 = $rj->dest_cdn ?: '—';
+                $destCdnDisplay = '';
+                if (!empty($rj->dest_cdn) && !empty($rj->dest_bucket)) {
+                    $destCdnDisplay = 'https://' . $esc($rj->dest_bucket) . '.' . str_replace('https://', '', $esc($rj->dest_cdn));
+                }
+                $o .= '<tr style="background:#f8f9fa;">';
+                $o .= '<td><span class="label label-info">Replica</span></td>';
+                $o .= '<td>' . $esc($rj->dest_region_name) . '</td>';
+                $o .= '<td><code style="font-size:11px;">' . $esc($destS3) . '</code> <button class="btn btn-xs btn-default" onclick="navigator.clipboard.writeText(\'' . $esc($destS3) . '\');this.innerHTML=\'<i class=\\\'fas fa-check\\\'></i>\';var b=this;setTimeout(function(){b.innerHTML=\'<i class=\\\'fas fa-copy\\\'></i>\';},1000);" title="Copy"><i class="fas fa-copy"></i></button></td>';
+                $o .= '<td>' . (!empty($destCdnDisplay) ? '<code style="font-size:11px;">' . $esc($destCdnDisplay) . '</code>' : '<span class="text-muted">—</span>') . '</td>';
+                $o .= '<td><span class="label label-default">Read Only</span></td>';
+                $o .= '</tr>';
+            }
+
+            $o .= '</tbody></table>';
+            $o .= '</div></div>';
+        }
 
         // Suspended jobs alert
         $suspendedJobs = Capsule::table('mod_impulseminio_replication_jobs')
@@ -1306,6 +1523,8 @@ function impulseminio_renderClientArea(array $params = []): string
         if ($suspendedJobs > 0) {
             $o .= '<div class="alert alert-warning" style="margin-top:10px;"><i class="fas fa-exclamation-triangle"></i> <strong>' . $suspendedJobs . ' replication job(s) were paused during suspension.</strong> Review and re-enable them in the Replication tab.</div>';
         }
+
+        $o .= '</div>'; // close tab-replication
     }
 
     $o .= '</div>'; // tab-content
@@ -1404,12 +1623,13 @@ document.body.removeChild(a);URL.revokeObjectURL(url);
 }
 DLCRED;
     // File Browser JS
-    $o .= 'var fbServiceId=' . $serviceId . ',fbCurrentBucket="' . $defaultBucket . '",fbCurrentPrefix="",fbCsrf=csrfToken,fbVersioning=false;';
-    $o .= 'function fbAjax(action,data,cb){data.modop="custom";data.a=action;data.id=fbServiceId;data.token=fbCsrf;var x=new XMLHttpRequest();x.open("POST","clientarea.php?action=productdetails&id="+fbServiceId,true);x.setRequestHeader("Content-Type","application/x-www-form-urlencoded");x.setRequestHeader("X-Requested-With","XMLHttpRequest");x.onload=function(){try{cb(JSON.parse(x.responseText));}catch(e){cb({success:false,error:"Invalid response"});}};x.onerror=function(){cb({success:false,error:"Network error"});};var q=[];for(var k in data)q.push(encodeURIComponent(k)+"="+encodeURIComponent(data[k]));x.send(q.join("&"));}';
+    $o .= 'var fbServiceId=' . $serviceId . ',fbCurrentBucket="' . $defaultBucket . '",fbCurrentPrefix="",fbCsrf=csrfToken,fbVersioning=false,fbReadOnly=false,fbRegionServerId=0;';
+    $o .= 'function fbBucketChanged(sel){var opt=sel.options[sel.selectedIndex];fbReadOnly=opt.getAttribute("data-readonly")==="1";fbRegionServerId=parseInt(opt.getAttribute("data-server")||"0");fbNavigate(opt.value,"");var badge=document.getElementById("fb-readonly-badge");var uploadBtn=document.getElementById("fb-upload-btn");var folderBtn=document.getElementById("fb-folder-upload-btn");var newfolderBtn=document.getElementById("fb-newfolder-btn");if(fbReadOnly){badge.style.display="inline";uploadBtn.style.display="none";if(folderBtn)folderBtn.style.display="none";newfolderBtn.style.display="none";document.getElementById("fb-upload-zone").style.display="none";}else{badge.style.display="none";uploadBtn.style.display="inline-block";if(folderBtn)folderBtn.style.display="inline-block";newfolderBtn.style.display="inline-block";fbRegionServerId=0;}}';
+    $o .= 'function fbAjax(action,data,cb){data.modop="custom";data.a=action;data.id=fbServiceId;data.token=fbCsrf;if(fbRegionServerId>0)data.region_server_id=fbRegionServerId;var x=new XMLHttpRequest();x.open("POST","clientarea.php?action=productdetails&id="+fbServiceId,true);x.setRequestHeader("Content-Type","application/x-www-form-urlencoded");x.setRequestHeader("X-Requested-With","XMLHttpRequest");x.onload=function(){try{cb(JSON.parse(x.responseText));}catch(e){cb({success:false,error:"Invalid response"});}};x.onerror=function(){cb({success:false,error:"Network error"});};var q=[];for(var k in data)q.push(encodeURIComponent(k)+"="+encodeURIComponent(data[k]));x.send(q.join("&"));}';
 
     $o .= 'function fbNavigate(bucket,prefix){if(bucket!==null)fbCurrentBucket=bucket;fbCurrentPrefix=prefix||"";fbRefresh();}';
 
-    $o .= 'function fbRefresh(){var body=document.getElementById("fb-body"),loading=document.getElementById("fb-loading"),empty=document.getElementById("fb-empty"),tbl=document.getElementById("fb-table");body.innerHTML="";loading.style.display="block";tbl.style.display="none";empty.style.display="none";fbUpdateBreadcrumb();fbAjax("clientListObjects",{bucket_name:fbCurrentBucket,prefix:fbCurrentPrefix},function(r){loading.style.display="none";if(typeof r.versioning!=="undefined")fbVersioning=r.versioning;if(!r.success){body.innerHTML=\'<tr><td colspan="5" class="text-center text-danger">\'+r.error+\'</td></tr>\';tbl.style.display="table";return;}if(!r.objects||r.objects.length===0){empty.style.display="block";tbl.style.display="none";return;}tbl.style.display="table";r.objects.forEach(function(obj){var tr=document.createElement("tr");if(obj.type==="folder"){tr.innerHTML=\'<td><i class="fas fa-folder" style="color:#f0c040;font-size:16px;"></i></td><td><a href="#" onclick="fbNavigate(null,\\\'\'+obj.key+\'\\\');return false;" style="font-weight:500;">\'+fbDisplayName(obj.key)+\'</a></td><td class="text-muted">&mdash;</td><td class="text-muted">&mdash;</td><td><button class="btn btn-xs btn-danger" onclick="fbDeleteObject(\\\'\'+obj.key+\'\\\',true)" title="Delete folder"><i class="fas fa-trash"></i></button></td>\';}else{tr.innerHTML=\'<td><i class="fas fa-file" style="color:#5c7cfa;font-size:16px;"></i></td><td>\'+fbDisplayName(obj.key)+\'</td><td class="text-muted">\'+fbFormatSize(obj.size)+\'</td><td class="text-muted">\'+fbFormatDate(obj.lastModified)+\'</td><td style="white-space:nowrap;"><button class="btn btn-xs btn-primary" onclick="fbDownload(\\\'\'+obj.key+\'\\\')" title="Download"><i class="fas fa-download"></i></button> <button class="btn btn-xs btn-danger" onclick="fbDeleteObject(\\\'\'+obj.key+\'\\\',false)" title="Delete"><i class="fas fa-trash"></i></button></td>\';}body.appendChild(tr);});});}';
+    $o .= 'function fbRefresh(){var body=document.getElementById("fb-body"),loading=document.getElementById("fb-loading"),empty=document.getElementById("fb-empty"),tbl=document.getElementById("fb-table");body.innerHTML="";loading.style.display="block";tbl.style.display="none";empty.style.display="none";fbUpdateBreadcrumb();fbAjax("clientListObjects",{bucket_name:fbCurrentBucket,prefix:fbCurrentPrefix},function(r){loading.style.display="none";if(typeof r.versioning!=="undefined")fbVersioning=r.versioning;if(!r.success){body.innerHTML=\'<tr><td colspan="5" class="text-center text-danger">\'+r.error+\'</td></tr>\';tbl.style.display="table";return;}if(!r.objects||r.objects.length===0){empty.style.display="block";tbl.style.display="none";return;}tbl.style.display="table";r.objects.forEach(function(obj){var tr=document.createElement("tr");var delBtn=fbReadOnly?"":"<button class=\"btn btn-xs btn-danger\" onclick=\"fbDeleteObject(\'"+obj.key+"\',"+( obj.type==="folder"?"true":"false")+")\" title=\"Delete\"><i class=\"fas fa-trash\"></i></button>";if(obj.type==="folder"){tr.innerHTML=\'<td><i class="fas fa-folder" style="color:#f0c040;font-size:16px;"></i></td><td><a href="#" onclick="fbNavigate(null,\\\'\'+obj.key+\'\\\');return false;" style="font-weight:500;">\'+fbDisplayName(obj.key)+\'</a></td><td class="text-muted">&mdash;</td><td class="text-muted">&mdash;</td><td>\'+delBtn+\'</td>\';}else{tr.innerHTML=\'<td><i class="fas fa-file" style="color:#5c7cfa;font-size:16px;"></i></td><td>\'+fbDisplayName(obj.key)+\'</td><td class="text-muted">\'+fbFormatSize(obj.size)+\'</td><td class="text-muted">\'+fbFormatDate(obj.lastModified)+\'</td><td style="white-space:nowrap;"><button class="btn btn-xs btn-primary" onclick="fbDownload(\\\'\'+obj.key+\'\\\')" title="Download"><i class="fas fa-download"></i></button> \'+delBtn+\'</td>\';}body.appendChild(tr);});});}';
 
     $o .= 'function fbDisplayName(key){var parts=key.replace(fbCurrentPrefix,"").split("/");return parts.filter(function(p){return p.length>0;})[0]||key;}';
 
@@ -1429,9 +1649,8 @@ DLCRED;
 
     $o .= 'function fbHandleDrop(e){e.preventDefault();e.currentTarget.style.borderColor="#ccc";e.currentTarget.style.background="#fafafa";if(e.dataTransfer.files.length>0)fbUploadFiles(e.dataTransfer.files);}';
 
-    $o .= 'function fbUploadFiles(files){var prog=document.getElementById("fb-upload-progress");var total=files.length,done=0,failed=0;prog.innerHTML=\'<div class="progress" style="height:20px;"><div class="progress-bar progress-bar-striped active" style="width:0%;">0/\'+total+\'</div></div>\';for(var i=0;i<total;i++){(function(file){var objectKey=fbCurrentPrefix+file.name;fbAjax("clientGetUploadUrl",{bucket_name:fbCurrentBucket,object_key:objectKey},function(r){if(!r.success||!r.url){failed++;checkDone();return;}var fd=new FormData();if(r.fields){for(var k in r.fields){fd.append(k,r.fields[k]);}}fd.append("file",file);var xhr=new XMLHttpRequest();xhr.open("POST",r.url,true);xhr.onload=function(){if(xhr.status>=200&&xhr.status<300)done++;else failed++;checkDone();};xhr.onerror=function(){failed++;checkDone();};xhr.send(fd);});})(files[i]);}function checkDone(){var pct=Math.round(((done+failed)/total)*100);prog.querySelector(".progress-bar").style.width=pct+"%";prog.querySelector(".progress-bar").textContent=(done+failed)+"/"+total;if(done+failed>=total){setTimeout(function(){prog.innerHTML=\'<p class="text-success"><i class="fas fa-check"></i> \'+done+\' uploaded\'+( failed?\', <span class="text-danger">\'+failed+\' failed</span>\':\'\')+\'</p>\';document.getElementById("fb-upload-zone").style.display="none";fbRefresh();},500);}}}';
+    $o .= 'function fbUploadFiles(files,isFolder){var prog=document.getElementById("fb-upload-progress");var total=files.length,done=0,failed=0;if(total===0)return;prog.innerHTML=\'<div class="progress" style="height:20px;"><div class="progress-bar progress-bar-striped active" style="width:0%;">0/\'+total+\'</div></div>\';for(var i=0;i<total;i++){(function(file){var objectKey;if(isFolder&&file.webkitRelativePath){objectKey=fbCurrentPrefix+file.webkitRelativePath;}else{objectKey=fbCurrentPrefix+file.name;}fbAjax("clientGetUploadUrl",{bucket_name:fbCurrentBucket,object_key:objectKey},function(r){if(!r.success||!r.url){failed++;checkDone();return;}var fd=new FormData();if(r.fields){for(var k in r.fields){fd.append(k,r.fields[k]);}}fd.append("file",file);var xhr=new XMLHttpRequest();xhr.open("POST",r.url,true);xhr.onload=function(){if(xhr.status>=200&&xhr.status<300)done++;else failed++;checkDone();};xhr.onerror=function(){failed++;checkDone();};xhr.send(fd);});})(files[i]);}function checkDone(){var pct=Math.round(((done+failed)/total)*100);prog.querySelector(".progress-bar").style.width=pct+"%";prog.querySelector(".progress-bar").textContent=(done+failed)+"/"+total;if(done+failed>=total){setTimeout(function(){prog.innerHTML=\'<p class="text-success"><i class="fas fa-check"></i> \'+done+\' uploaded\'+( failed?\', <span class="text-danger">\'+failed+\' failed</span>\':\'\')+\'</p>\';document.getElementById("fb-upload-input").value="";if(document.getElementById("fb-folder-input"))document.getElementById("fb-folder-input").value="";setTimeout(function(){document.getElementById("fb-upload-progress").innerHTML="";document.getElementById("fb-upload-zone").style.display="none";},2000);fbRefresh();},500);}}}';
 
-    $o .= 'function fbUploadFolder(files){var prog=document.getElementById("fb-upload-progress");var total=files.length,done=0,failed=0;if(!total)return;prog.innerHTML=\'<div class="progress" style="height:20px;"><div class="progress-bar progress-bar-striped active" style="width:0%;">0/\'+total+\'</div></div>\';for(var i=0;i<total;i++){(function(file){var rel=file.webkitRelativePath||file.name;var objectKey=fbCurrentPrefix+rel;fbAjax("clientGetUploadUrl",{bucket_name:fbCurrentBucket,object_key:objectKey},function(r){if(!r.success||!r.url){failed++;checkDone();return;}var fd=new FormData();if(r.fields){for(var k in r.fields){fd.append(k,r.fields[k]);}}fd.append("file",file);var xhr=new XMLHttpRequest();xhr.open("POST",r.url,true);xhr.onload=function(){if(xhr.status>=200&&xhr.status<300)done++;else failed++;checkDone();};xhr.onerror=function(){failed++;checkDone();};xhr.send(fd);});})(files[i]);}function checkDone(){var pct=Math.round(((done+failed)/total)*100);prog.querySelector(".progress-bar").style.width=pct+"%";prog.querySelector(".progress-bar").textContent=(done+failed)+"/"+total;if(done+failed>=total){setTimeout(function(){prog.innerHTML=\'<p class="text-success"><i class="fas fa-check"></i> \'+done+\' uploaded\'+(failed?\', <span class="text-danger">\'+failed+\' failed</span>\':\'\')+\'</p>\';document.getElementById("fb-folder-input").value="";document.getElementById("fb-upload-zone").style.display="none";fbRefresh();},500);}}}';
     // Auto-load files when switching to file browser tab
     $o .= 'document.querySelectorAll(".nav-tabs a[href=\'#tab-files\']").forEach(function(a){a.addEventListener("click",function(){setTimeout(function(){if(document.getElementById("fb-body").children.length<=1)fbRefresh();},100);});});';
     // Fix 8: Activate correct tab from URL hash on page load
@@ -1877,19 +2096,22 @@ function impulseminio_clientListObjects(array $params): string
 
         if (empty($bucketName)) return impulseminio_jsonResponse(['success' => false, 'error' => 'No bucket specified.']);
 
-        // Verify bucket ownership
         impulseminio_ensureTables();
+        if (!impulseminio_validateBucketAccess($serviceId, $bucketName)) {
+            return impulseminio_jsonResponse(['success' => false, 'error' => 'Bucket not found.']);
+        }
+
+        $client = impulseminio_getRequestClient($params);
+        $r = $client->listObjects($bucketName, $prefix);
+
+        // Check versioning from primary buckets table
         $bucket = Capsule::table('mod_impulseminio_buckets')
             ->where('service_id', $serviceId)->where('bucket_name', $bucketName)->first();
-        if (!$bucket) return impulseminio_jsonResponse(['success' => false, 'error' => 'Bucket not found.']);
-
-        $client = impulseminio_getServiceClient($params);
-        $r = $client->listObjects($bucketName, $prefix);
 
         return impulseminio_jsonResponse([
             'success'    => $r['success'],
             'objects'    => $r['objects'] ?? [],
-            'versioning' => !empty($bucket->versioning),
+            'versioning' => $bucket ? !empty($bucket->versioning) : false,
             'error'      => $r['error'] ?? null,
         ]);
     } catch (\Exception $e) {
@@ -1912,11 +2134,11 @@ function impulseminio_clientDownloadObject(array $params): string
             return impulseminio_jsonResponse(['success' => false, 'error' => 'Missing bucket or object key.']);
 
         impulseminio_ensureTables();
-        $bucket = Capsule::table('mod_impulseminio_buckets')
-            ->where('service_id', $serviceId)->where('bucket_name', $bucketName)->first();
-        if (!$bucket) return impulseminio_jsonResponse(['success' => false, 'error' => 'Bucket not found.']);
+        if (!impulseminio_validateBucketAccess($serviceId, $bucketName)) {
+            return impulseminio_jsonResponse(['success' => false, 'error' => 'Bucket not found.']);
+        }
 
-        $client = impulseminio_getServiceClient($params);
+        $client = impulseminio_getRequestClient($params);
         $r = $client->getPresignedDownloadUrl($bucketName, $objectKey, 3600);
 
         return impulseminio_jsonResponse([

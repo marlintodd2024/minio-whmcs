@@ -331,14 +331,16 @@ class MinioClient
             if (!$data) continue;
             $relKey = $data['key'] ?? '';
             if (empty($relKey)) continue;
+            // Filter mc ls phantom entries: "/" or empty after trim for folders containing only subfolders
+            if ($relKey === '/' || trim($relKey, '/') === '') continue;
             // Hide .keep marker files used for empty folder creation
             if ($relKey === '.keep' || substr($relKey, -6) === '/.keep') continue;
-            // Hide phantom '/' entries returned by mc ls for empty folders
-            if ($relKey === '/' || trim($relKey, '/') === '') continue;
             $isDir = (!empty($data['type']) && $data['type'] === 'folder')
                   || substr($relKey, -1) === '/';
             // mc ls returns keys relative to the listed path — prepend prefix for full path
             $fullKey = $prefix . $relKey;
+            // Normalize: remove double slashes
+            $fullKey = preg_replace('#/{2,}#', '/', $fullKey);
             $objects[] = [
                 'key'          => $fullKey,
                 'size'         => (int)($data['size'] ?? 0),
