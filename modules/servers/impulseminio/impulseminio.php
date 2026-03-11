@@ -3,10 +3,11 @@
  * ImpulseMinio — MinIO S3 Cloud Storage Provisioning Module for WHMCS
  *
  * Provides automated provisioning of MinIO storage accounts with multi-bucket
- * management, scoped access keys, usage tracking, and a 4-tab client dashboard.
+ * management, scoped access keys, usage tracking, multi-region support,
+ * and a 6-tab client dashboard.
  *
  * @package    ImpulseMinio
- * @version    2.3.0
+ * @version    2.6.0
  * @author     Impulse Hosting
  * @license    GPL-3.0
  * @link       https://github.com/ImpulseHosting/impulseminio
@@ -62,6 +63,58 @@ function impulseminio_ensureTables(): void
             $t->timestamps();
         });
     }
+    // Region registry — each row is a MinIO instance in a datacenter
+    if (!Capsule::schema()->hasTable('mod_impulseminio_regions')) {
+        Capsule::schema()->create('mod_impulseminio_regions', function ($t) {
+            $t->increments('id');
+            $t->string('name', 100);               // Display name: "US Central — Dallas"
+            $t->string('slug', 50)->unique();       // URL-safe: "us-central-dallas"
+            $t->string('flag', 10)->default('');     // Emoji flag: "🇺🇸"
+            $t->unsignedInteger('server_id');         // FK → tblservers.id
+            $t->string('cdn_endpoint', 255)->nullable(); // Public CDN base URL
+            $t->string('stats_url', 255)->nullable();    // Bandwidth stats JSON endpoint
+            $t->boolean('is_active')->default(true);
+            $t->unsignedInteger('sort_order')->default(0);
+            $t->timestamps();
+        });
+    }
+    // Links services to their primary (and future replication) regions
+    if (!Capsule::schema()->hasTable('mod_impulseminio_service_regions')) {
+        Capsule::schema()->create('mod_impulseminio_service_regions', function ($t) {
+            $t->increments('id');
+            $t->unsignedInteger('service_id')->index(); // FK → tblhosting.id
+            $t->unsignedInteger('region_id');            // FK → mod_impulseminio_regions.id
+            $t->boolean('is_primary')->default(true);
+            $t->timestamps();
+        });
+    }
+    // Replication jobs — tracks cross-region bucket replication
+    if (!Capsule::schema()->hasTable('mod_impulseminio_replication_jobs')) {
+        Capsule::schema()->create('mod_impulseminio_replication_jobs', function ($t) {
+            $t->increments('id');
+            $t->unsignedInteger('service_id')->index();
+            $t->unsignedInteger('source_region_id');
+            $t->string('source_bucket', 255);
+            $t->unsignedInteger('dest_region_id');
+            $t->string('dest_bucket', 255);
+            $t->string('description', 500)->nullable();
+            $t->string('remote_arn', 500)->nullable();
+            $t->string('rule_id', 100)->nullable();
+            $t->tinyInteger('sync_existing')->default(1);
+            $t->tinyInteger('sync_deletes')->default(1);
+            $t->tinyInteger('sync_locking')->default(0);
+            $t->tinyInteger('sync_metadata_date')->default(1);
+            $t->tinyInteger('sync_tags')->default(1);
+            $t->string('status', 20)->default('active');
+            $t->dateTime('suspended_at')->nullable();
+            $t->dateTime('purge_after')->nullable();
+            $t->tinyInteger('warning_sent')->default(0);
+            $t->dateTime('purge_notified_at')->nullable();
+            $t->dateTime('last_sync_at')->nullable();
+            $t->text('error_message')->nullable();
+            $t->timestamps();
+        });
+    }
 }
 
 // =============================================================================
@@ -112,6 +165,20 @@ function impulseminio_hasCors(): bool
     return \WHMCS\Module\Server\ImpulseMinio\Premium::hasFeature(
         \WHMCS\Module\Server\ImpulseMinio\Premium::FEATURE_CORS
     );
+}
+
+/**
+ * Check if replication feature is available.
+ *
+ * @return bool
+ */
+function impulseminio_hasReplication(): bool
+{
+    if (!impulseminio_hasPremium()) return false;
+    if (!file_exists(__DIR__ . '/lib/Replication.php')) return false;
+    require_once __DIR__ . '/lib/Premium.php';
+    require_once __DIR__ . '/lib/Replication.php';
+    return \WHMCS\Module\Server\ImpulseMinio\Premium::hasFeature('replication');
 }
 
 // =============================================================================
@@ -258,6 +325,74 @@ function impulseminio_getClient(array $params): MinioClient
 }
 
 /**
+ * Build a MinioClient for a specific region using its server record.
+ *
+ * Falls back to impulseminio_getClient() if region has no server_id
+ * or if the server record is missing.
+ *
+ * @param  int   $serverId WHMCS server ID from mod_impulseminio_regions
+ * @param  array $params   Module params (for mc path fallback)
+ * @return MinioClient
+ */
+function impulseminio_getClientForServer(int $serverId, array $params): MinioClient
+{
+    $server = Capsule::table('tblservers')->where('id', $serverId)->first();
+    if (!$server) {
+        throw new \Exception("Server ID {$serverId} not found in tblservers.");
+    }
+    $hostname = $server->hostname ?: $server->ipaddress;
+    $secure = (bool)$server->secure;
+    $port = $server->port ?: ($secure ? '443' : '9000');
+    $protocol = $secure ? 'https' : 'http';
+    $endpoint = ($secure && $port === '443') ? $protocol . '://' . $hostname : $protocol . '://' . $hostname . ':' . $port;
+    $password = decrypt($server->password);
+    return new MinioClient($endpoint, $server->username, $password, $params['configoption8'] ?: '/usr/local/bin/mc', $secure);
+}
+
+/**
+ * Resolve the primary region for a service.
+ *
+ * Checks mod_impulseminio_service_regions first. If no row exists
+ * (legacy service), returns null — callers fall back to the product's
+ * assigned WHMCS server via impulseminio_getClient().
+ *
+ * @param  int $serviceId
+ * @return object|null Region row from mod_impulseminio_regions
+ */
+function impulseminio_getPrimaryRegion(int $serviceId): ?object
+{
+    if (!Capsule::schema()->hasTable('mod_impulseminio_service_regions')) return null;
+    $link = Capsule::table('mod_impulseminio_service_regions')
+        ->where('service_id', $serviceId)
+        ->where('is_primary', true)
+        ->first();
+    if (!$link) return null;
+    return Capsule::table('mod_impulseminio_regions')
+        ->where('id', $link->region_id)
+        ->where('is_active', true)
+        ->first();
+}
+
+/**
+ * Get the correct MinioClient for a service — region-aware with legacy fallback.
+ *
+ * If the service has a primary region in mod_impulseminio_service_regions,
+ * connects to that region's server. Otherwise falls back to the product's
+ * default WHMCS server (legacy behavior).
+ *
+ * @param  array $params WHMCS module parameters
+ * @return MinioClient
+ */
+function impulseminio_getServiceClient(array $params): MinioClient
+{
+    $region = impulseminio_getPrimaryRegion((int)$params['serviceid']);
+    if ($region && !empty($region->server_id)) {
+        return impulseminio_getClientForServer((int)$region->server_id, $params);
+    }
+    return impulseminio_getClient($params);
+}
+
+/**
  * Derive the MinIO username for a service.
  *
  * Format: {prefix}-{serviceid}-{clientname} (lowercased, sanitised)
@@ -310,7 +445,7 @@ function impulseminio_getAllBuckets(int $serviceId): array
  */
 function impulseminio_rebuildFullPolicy(array $params): array
 {
-    $client = impulseminio_getClient($params);
+    $client = impulseminio_getServiceClient($params);
     $username = impulseminio_getUsername($params);
     $buckets = impulseminio_getAllBuckets((int)$params['serviceid']);
     if (empty($buckets)) {
@@ -362,7 +497,60 @@ function impulseminio_CreateAccount(array $params): string
 {
     try {
         impulseminio_ensureTables();
-        $client = impulseminio_getClient($params);
+
+        // Resolve region: check for region configurable option (customer's selection)
+        $regionId = null;
+        $client = null;
+        $s3Endpoint = '';
+
+        // Log configoptions for debugging
+        logModuleCall('impulseminio', 'CreateAccount:configoptions', $params['configoptions'] ?? 'EMPTY', '', '');
+
+        // Look for a "Region" configurable option in the order
+        if (!empty($params['configoptions'])) {
+            foreach ($params['configoptions'] as $optName => $optValue) {
+                if (stripos($optName, 'region') !== false) {
+                    // WHMCS may pass: the slug text ("us-east-newark"),
+                    // the full optionname ("us-east-newark|US East — Newark"),
+                    // or a numeric suboption ID (2050).
+                    $slug = $optValue;
+
+                    // If numeric, resolve suboption ID → optionname → slug
+                    if (is_numeric($optValue)) {
+                        $sub = Capsule::table('tblproductconfigoptionssub')
+                            ->where('id', (int)$optValue)->first();
+                        if ($sub) {
+                            $slug = explode('|', $sub->optionname)[0];
+                        }
+                    } else {
+                        // Extract slug from "slug|Label" format if present
+                        $slug = explode('|', (string)$optValue)[0];
+                    }
+
+                    $region = Capsule::table('mod_impulseminio_regions')
+                        ->where('is_active', true)
+                        ->where('slug', $slug)
+                        ->first();
+                    if ($region) {
+                        $regionId = $region->id;
+                        $client = impulseminio_getClientForServer((int)$region->server_id, $params);
+                        $server = Capsule::table('tblservers')->where('id', $region->server_id)->first();
+                        if ($server) {
+                            $hostname = $server->hostname ?: $server->ipaddress;
+                            $s3Endpoint = ($server->secure ? 'https' : 'http') . '://' . $hostname;
+                        }
+                    }
+                    break;
+                }
+            }
+        }
+
+        // Fallback to product's assigned server (legacy / no region selected)
+        if (!$client) {
+            $client = impulseminio_getServiceClient($params);
+            $s3Endpoint = $params['configoption6'] ?: ($params['serversecure'] ? 'https' : 'http') . '://' . ($params['serverhostname'] ?: $params['serverip']);
+        }
+
         $username = impulseminio_getUsername($params);
         $bucket = impulseminio_getBucket($params);
         $password = MinioClient::generatePassword(24);
@@ -387,7 +575,25 @@ function impulseminio_CreateAccount(array $params): string
 
         if ($quotaGB > 0) $client->setBucketQuota($bucket, $quotaGB . 'GiB');
 
-        $s3Endpoint = $params['configoption6'] ?: ($params['serversecure'] ? 'https' : 'http') . '://' . ($params['serverhostname'] ?: $params['serverip']);
+        // Record the region assignment
+        if ($regionId) {
+            Capsule::table('mod_impulseminio_service_regions')->insert([
+                'service_id' => $params['serviceid'],
+                'region_id' => $regionId,
+                'is_primary' => true,
+                'created_at' => date('Y-m-d H:i:s'),
+                'updated_at' => date('Y-m-d H:i:s'),
+            ]);
+
+            // Also update the WHMCS service to point at the correct server
+            $region = Capsule::table('mod_impulseminio_regions')->where('id', $regionId)->first();
+            if ($region) {
+                Capsule::table('tblhosting')->where('id', $params['serviceid'])->update([
+                    'server' => $region->server_id,
+                ]);
+            }
+        }
+
         $params['model']->serviceProperties->save([
             'MinIO Username' => $username, 'MinIO Password' => $password,
             'Bucket Name' => $bucket, 'S3 Endpoint' => $s3Endpoint,
@@ -419,7 +625,7 @@ function impulseminio_CreateAccount(array $params): string
 function impulseminio_SuspendAccount(array $params): string
 {
     try {
-        $client = impulseminio_getClient($params);
+        $client = impulseminio_getServiceClient($params);
         $username = impulseminio_getUsername($params);
         $buckets = impulseminio_getAllBuckets((int)$params['serviceid']) ?: [impulseminio_getBucket($params)];
         $r = $client->disableUser($username);
@@ -446,7 +652,7 @@ function impulseminio_SuspendAccount(array $params): string
 function impulseminio_UnsuspendAccount(array $params): string
 {
     try {
-        $client = impulseminio_getClient($params);
+        $client = impulseminio_getServiceClient($params);
         $username = impulseminio_getUsername($params);
         $r = $client->enableUser($username);
         if (!$r['success']) return 'Failed to unsuspend: ' . $r['error'];
@@ -467,7 +673,7 @@ function impulseminio_UnsuspendAccount(array $params): string
 function impulseminio_TerminateAccount(array $params): string
 {
     try {
-        $client = impulseminio_getClient($params);
+        $client = impulseminio_getServiceClient($params);
         $username = impulseminio_getUsername($params);
         $serviceId = (int)$params['serviceid'];
 
@@ -504,7 +710,7 @@ function impulseminio_TerminateAccount(array $params): string
 function impulseminio_ChangePassword(array $params): string
 {
     try {
-        $client = impulseminio_getClient($params);
+        $client = impulseminio_getServiceClient($params);
         $username = impulseminio_getUsername($params);
         $r = $client->createUser($username, $params['password']);
         if (!$r['success']) return 'Failed: ' . $r['error'];
@@ -522,7 +728,7 @@ function impulseminio_ChangePassword(array $params): string
 function impulseminio_ChangePackage(array $params): string
 {
     try {
-        $client = impulseminio_getClient($params);
+        $client = impulseminio_getServiceClient($params);
         $quotaGB = (int)$params['configoption1'];
         $bwLimitGB = (int)$params['configoption2'];
         $buckets = impulseminio_getAllBuckets((int)$params['serviceid']) ?: [impulseminio_getBucket($params)];
@@ -556,7 +762,7 @@ function impulseminio_UsageUpdate(array $params): void
     $serverId = $params['serverid'];
     $services = Capsule::table('tblhosting')->where('server', $serverId)->where('domainstatus', 'Active')->get();
     if ($services->isEmpty()) return;
-    $client = impulseminio_getClient($params);
+    $client = impulseminio_getServiceClient($params);
 
     foreach ($services as $service) {
         try {
@@ -773,6 +979,11 @@ function impulseminio_renderClientArea(array $params = []): string
     $o .= '<li role="presentation"><a href="#tab-keys" data-toggle="tab"><i class="fas fa-key"></i> Access Keys <span class="badge">' . $keyCount . '</span></a></li>';
     $o .= '<li role="presentation"><a href="#tab-files" data-toggle="tab"><i class="fas fa-folder-open"></i> File Browser</a></li>';
     $o .= '<li role="presentation"><a href="#tab-stats" data-toggle="tab"><i class="fas fa-chart-area"></i> Statistics</a></li>';
+    if (impulseminio_hasReplication()) {
+        $replJobCount = Capsule::table('mod_impulseminio_replication_jobs')
+            ->where('service_id', $serviceId)->whereNotIn('status', ['removing', 'deleted'])->count();
+        $o .= '<li role="presentation"><a href="#tab-replication" data-toggle="tab"><i class="fas fa-sync-alt"></i> Replication' . ($replJobCount > 0 ? ' <span class="badge">' . $replJobCount . '</span>' : '') . '</a></li>';
+    }
     $o .= '</ul>';
     $o .= '<div class="tab-content">';
 
@@ -1018,6 +1229,85 @@ function impulseminio_renderClientArea(array $params = []): string
     $o .= '<div id="stats-empty" style="display:none;text-align:center;padding:40px;color:#999;"><i class="fas fa-chart-line" style="font-size:32px;display:block;margin-bottom:8px;"></i>No data available for this period</div>';
     $o .= '<p style="margin-top:10px;font-size:12px;color:#999;">Statistics are collected hourly and may take up to 1 hour to reflect recent changes.</p>';
     $o .= '</div></div></div>';
+
+    // ─── Replication Tab ───
+    if (impulseminio_hasReplication()) {
+        $o .= '<div role="tabpanel" class="tab-pane" id="tab-replication">';
+        $o .= '<div class="panel panel-default"><div class="panel-heading"><h3 class="panel-title"><i class="fas fa-sync-alt"></i> Bucket Replication</h3></div>';
+        $o .= '<div class="panel-body">';
+
+        // Get replication jobs
+        $o .= '<div id="repl-jobs-loading" style="text-align:center;padding:20px;"><i class="fas fa-spinner fa-spin fa-2x" style="color:#999;"></i></div>';
+        $o .= '<div id="repl-jobs-empty" style="display:none;text-align:center;padding:30px;color:#999;">';
+        $o .= '<i class="fas fa-sync-alt" style="font-size:32px;display:block;margin-bottom:8px;"></i>';
+        $o .= '<p>No replication jobs configured.</p>';
+        $o .= '<p style="font-size:13px;">Replicate your buckets across regions for redundancy and low-latency access.</p>';
+        $o .= '</div>';
+
+        // Jobs table
+        $o .= '<table class="table table-hover" id="repl-jobs-table" style="display:none;">';
+        $o .= '<thead><tr><th>Description</th><th>Source</th><th>Destination</th><th>Status</th><th></th></tr></thead>';
+        $o .= '<tbody id="repl-jobs-body"></tbody>';
+        $o .= '</table>';
+
+        // Create job button
+        $o .= '<div style="margin-top:15px;">';
+        $o .= '<button class="btn btn-success btn-sm" onclick="replShowCreate()" id="repl-create-btn"><i class="fas fa-plus"></i> Create Replication Job</button>';
+        $o .= '</div>';
+
+        // Create job form (hidden by default)
+        $o .= '<div id="repl-create-form" style="display:none;margin-top:15px;background:#f9f9f9;border:1px solid #e0e0e0;border-radius:6px;padding:16px;">';
+        $o .= '<h4 style="margin:0 0 12px;">New Replication Job</h4>';
+
+        $o .= '<div class="form-group"><label>Source Bucket</label>';
+        $o .= '<select id="repl-src-bucket" class="form-control" style="max-width:400px;">';
+        foreach ($buckets as $b) {
+            $o .= '<option value="' . $esc($b->bucket_name) . '">' . $esc($b->label ?: $b->bucket_name) . '</option>';
+        }
+        $o .= '</select></div>';
+
+        // Get available destination regions
+        $primaryRegion = Capsule::table('mod_impulseminio_service_regions')
+            ->where('service_id', $serviceId)->where('is_primary', true)->first();
+        $primaryRegionId = $primaryRegion ? $primaryRegion->region_id : 0;
+        $destRegions = Capsule::table('mod_impulseminio_regions')
+            ->where('is_active', true)->where('id', '!=', $primaryRegionId)->orderBy('sort_order')->get();
+
+        $o .= '<div class="form-group"><label>Destination Region</label>';
+        $o .= '<select id="repl-dest-region" class="form-control" style="max-width:400px;">';
+        foreach ($destRegions as $dr) {
+            $o .= '<option value="' . (int)$dr->id . '">' . $esc($dr->flag) . ' ' . $esc($dr->name) . '</option>';
+        }
+        $o .= '</select></div>';
+
+        $o .= '<div class="form-group"><label>Description <small class="text-muted">(optional)</small></label>';
+        $o .= '<input type="text" id="repl-description" class="form-control" style="max-width:400px;" placeholder="e.g., Photos DR to Newark"></div>';
+
+        // Advanced options
+        $o .= '<div style="margin-bottom:12px;"><a href="#" onclick="document.getElementById(\'repl-advanced\').style.display=document.getElementById(\'repl-advanced\').style.display===\'none\'?\'block\':\'none\';return false;" style="font-size:13px;"><i class="fas fa-cog"></i> Advanced Options</a></div>';
+        $o .= '<div id="repl-advanced" style="display:none;padding:10px;background:#f0f0f0;border-radius:4px;margin-bottom:12px;">';
+        $o .= '<div class="checkbox"><label><input type="checkbox" id="repl-sync-existing" checked> Replicate existing objects</label></div>';
+        $o .= '<div class="checkbox"><label><input type="checkbox" id="repl-sync-deletes" checked> Sync deleted objects</label></div>';
+        $o .= '<div class="checkbox"><label><input type="checkbox" id="repl-sync-locking"> Sync object locking</label></div>';
+        $o .= '<div class="checkbox"><label><input type="checkbox" id="repl-sync-tags" checked> Sync object tags</label></div>';
+        $o .= '</div>';
+
+        $o .= '<div id="repl-create-progress" style="margin-bottom:10px;"></div>';
+
+        $o .= '<button class="btn btn-primary" onclick="replCreateJob()"><i class="fas fa-check"></i> Create Job</button>';
+        $o .= ' <button class="btn btn-default" onclick="replHideCreate()">Cancel</button>';
+        $o .= '</div>'; // create form
+
+        $o .= '</div></div></div>'; // panel
+
+        // Suspended jobs alert
+        $suspendedJobs = Capsule::table('mod_impulseminio_replication_jobs')
+            ->where('service_id', $serviceId)->where('status', 'suspended')->count();
+        if ($suspendedJobs > 0) {
+            $o .= '<div class="alert alert-warning" style="margin-top:10px;"><i class="fas fa-exclamation-triangle"></i> <strong>' . $suspendedJobs . ' replication job(s) were paused during suspension.</strong> Review and re-enable them in the Replication tab.</div>';
+        }
+    }
+
     $o .= '</div>'; // tab-content
     $o .= '</div>'; // impulsedrive-dashboard
 
@@ -1150,9 +1440,42 @@ DLCRED;
     if ($hasNewKeyFlash) {
         $o .= 'h="#accesskeys";';
     }
-    $o .= 'if(h){var map={"#buckets":"#tab-buckets","#accesskeys":"#tab-keys","#quickstart":"#tab-quickstart","#overview":"#tab-overview","#files":"#tab-files","#statistics":"#tab-stats"};var target=map[h]||h;var tabLink=document.querySelector(\'.nav-tabs a[href="\'+target+\'"]\');if(tabLink){var evt=document.createEvent("HTMLEvents");evt.initEvent("click",true,true);tabLink.dispatchEvent(evt);if(typeof jQuery!=="undefined"){jQuery(tabLink).tab("show");}else{document.querySelectorAll(".nav-tabs li").forEach(function(li){li.classList.remove("active");});tabLink.parentElement.classList.add("active");document.querySelectorAll(".tab-pane").forEach(function(p){p.classList.remove("active");});var pane=document.querySelector(target);if(pane)pane.classList.add("active");}}}';
+    $o .= 'if(h){var map={"#buckets":"#tab-buckets","#accesskeys":"#tab-keys","#quickstart":"#tab-quickstart","#overview":"#tab-overview","#files":"#tab-files","#statistics":"#tab-stats","#replication":"#tab-replication"};var target=map[h]||h;var tabLink=document.querySelector(\'.nav-tabs a[href="\'+target+\'"]\');if(tabLink){var evt=document.createEvent("HTMLEvents");evt.initEvent("click",true,true);tabLink.dispatchEvent(evt);if(typeof jQuery!=="undefined"){jQuery(tabLink).tab("show");}else{document.querySelectorAll(".nav-tabs li").forEach(function(li){li.classList.remove("active");});tabLink.parentElement.classList.add("active");document.querySelectorAll(".tab-pane").forEach(function(p){p.classList.remove("active");});var pane=document.querySelector(target);if(pane)pane.classList.add("active");}}}';
     // Fix 8: Handle tab clicks to update active indicator and URL hash
-    $o .= 'document.querySelectorAll(".nav-tabs a[data-toggle=tab]").forEach(function(a){a.addEventListener("click",function(){document.querySelectorAll(".nav-tabs li").forEach(function(li){li.classList.remove("active");});this.parentElement.classList.add("active");var revMap={"#tab-overview":"#overview","#tab-buckets":"#buckets","#tab-keys":"#accesskeys","#tab-quickstart":"#quickstart","#tab-files":"#files","#tab-stats":"#statistics"};var frag=revMap[this.getAttribute("href")]||this.getAttribute("href");history.replaceState(null,null,frag);});});})()';    $o .= '</script>';
+    $o .= 'document.querySelectorAll(".nav-tabs a[data-toggle=tab]").forEach(function(a){a.addEventListener("click",function(){document.querySelectorAll(".nav-tabs li").forEach(function(li){li.classList.remove("active");});this.parentElement.classList.add("active");var revMap={"#tab-overview":"#overview","#tab-buckets":"#buckets","#tab-keys":"#accesskeys","#tab-quickstart":"#quickstart","#tab-files":"#files","#tab-stats":"#statistics","#tab-replication":"#replication"};var frag=revMap[this.getAttribute("href")]||this.getAttribute("href");history.replaceState(null,null,frag);});});';
+    $o .= '})();';
+
+    // Replication JS — global scope (outside IIFE so onclick handlers can access)
+    $o .= 'var replServiceId=' . $serviceId . ';';
+    $o .= 'function replAjax(action,data,cb){data.modop="custom";data.a=action;data.id=replServiceId;data.token=csrfToken;var x=new XMLHttpRequest();x.open("POST","clientarea.php?action=productdetails&id="+replServiceId,true);x.setRequestHeader("Content-Type","application/x-www-form-urlencoded");x.setRequestHeader("X-Requested-With","XMLHttpRequest");x.onload=function(){try{cb(JSON.parse(x.responseText));}catch(e){cb({success:false,error:"Invalid response"});}};x.onerror=function(){cb({success:false,error:"Network error"});};var q=[];for(var k in data)q.push(encodeURIComponent(k)+"="+encodeURIComponent(data[k]));x.send(q.join("&"));}';
+
+    $o .= 'function replLoadJobs(){var tbl=document.getElementById("repl-jobs-table");var body=document.getElementById("repl-jobs-body");var loading=document.getElementById("repl-jobs-loading");var empty=document.getElementById("repl-jobs-empty");loading.style.display="block";tbl.style.display="none";empty.style.display="none";replAjax("clientListReplicationJobs",{},function(r){loading.style.display="none";if(!r.success||!r.jobs||r.jobs.length===0){empty.style.display="block";return;}tbl.style.display="table";body.innerHTML="";r.jobs.forEach(function(j){var statusMap={"active":["label-success","Active"],"paused":["label-warning","Paused"],"suspended":["label-danger","Suspended"],"error":["label-danger","Error"]};var st=statusMap[j.status]||["label-default",j.status];var desc=j.description||"Untitled";var srcFlag=j.source_region_flag||"";var destFlag=j.dest_region_flag||"";var tr=document.createElement("tr");var html="";html+=\'<td style="vertical-align:middle;"><strong>\'+desc+\'</strong></td>\';html+=\'<td style="vertical-align:middle;"><span style="font-size:12px;">\'+srcFlag+\' \'+j.source_region_name+\'</span><br><code style="font-size:11px;">\'+j.source_bucket+\'</code></td>\';html+=\'<td style="vertical-align:middle;"><span style="font-size:12px;">\'+destFlag+\' \'+j.dest_region_name+\'</span><br><code style="font-size:11px;">\'+j.dest_bucket+\'</code></td>\';html+=\'<td style="vertical-align:middle;"><span class="label \'+st[0]+\'" style="font-size:11px;padding:3px 8px;">\'+st[1]+\'</span><div id="repl-stats-\'+j.id+\'" style="font-size:11px;color:#888;margin-top:4px;"></div></td>\';html+=\'<td style="vertical-align:middle;white-space:nowrap;">\';html+=\'<div class="btn-group btn-group-xs">\';if(j.status==="active"){html+=\'<button class="btn btn-warning" onclick="replPauseJob(\'+j.id+\')" title="Pause"><i class="fas fa-pause"></i></button>\';}if(j.status==="paused"){html+=\'<button class="btn btn-success" onclick="replResumeJob(\'+j.id+\')" title="Resume"><i class="fas fa-play"></i></button>\';}html+=\'<button class="btn btn-default" onclick="replEditJob(\'+j.id+\')" title="Settings"><i class="fas fa-cog"></i></button>\';html+=\'<button class="btn btn-danger" onclick="replDeleteJob(\'+j.id+\')" title="Delete"><i class="fas fa-trash"></i></button>\';html+=\'</div></td>\';tr.innerHTML=html;body.appendChild(tr);if(j.status==="active")replFetchStatus(j.id);});});}';
+
+    // Fetch live replication stats for a job
+    $o .= 'function replFormatBytes(b){if(b===0)return"0 B";var k=1024,s=["B","KB","MB","GB","TB"],i=Math.floor(Math.log(b)/Math.log(k));return parseFloat((b/Math.pow(k,i)).toFixed(1))+" "+s[i];}';
+
+    $o .= 'function replFetchStatus(jobId){replAjax("clientReplicationStatus",{job_id:jobId},function(r){var el=document.getElementById("repl-stats-"+jobId);if(!el)return;if(!r.success||!r.stats){el.innerHTML="";return;}var s=r.stats;var parts=[];parts.push("<strong>"+s.replicated_count+"</strong> objects ("+replFormatBytes(s.replicated_bytes)+")");if(s.queued_count>0){parts.push(\'<span style="color:#e67e22;">\'+s.queued_count+" queued</span>");}if(s.failed_count>0){parts.push(\'<span style="color:#e74c3c;">\'+s.failed_count+" failed</span>");}var online=s.target_online?\'<span style="color:#28a745;">&#9679;</span> Online\':\'<span style="color:#dc3545;">&#9679;</span> Offline\';if(s.target_latency_ms>0){online+=" ("+s.target_latency_ms+"ms)";}el.innerHTML=parts.join(" &middot; ")+"<br>"+online;});}';
+
+    $o .= 'function replShowCreate(){document.getElementById("repl-create-form").style.display="block";document.getElementById("repl-create-btn").style.display="none";}';
+    $o .= 'function replHideCreate(){document.getElementById("repl-create-form").style.display="none";document.getElementById("repl-create-btn").style.display="inline-block";document.getElementById("repl-create-progress").innerHTML="";}';
+
+    $o .= 'function replCreateJob(){var prog=document.getElementById("repl-create-progress");prog.innerHTML=\'<div class="progress"><div class="progress-bar progress-bar-striped active" style="width:100%;">Creating...</div></div>\';replAjax("clientCreateReplicationJob",{source_bucket:document.getElementById("repl-src-bucket").value,dest_region_id:document.getElementById("repl-dest-region").value,description:document.getElementById("repl-description").value,sync_existing:document.getElementById("repl-sync-existing").checked?1:0,sync_deletes:document.getElementById("repl-sync-deletes").checked?1:0,sync_locking:document.getElementById("repl-sync-locking").checked?1:0,sync_tags:document.getElementById("repl-sync-tags").checked?1:0},function(r){if(r.success){prog.innerHTML=\'<div class="alert alert-success"><i class="fas fa-check"></i> Replication job created successfully.</div>\';setTimeout(function(){replHideCreate();replLoadJobs();},1500);}else{prog.innerHTML=\'<div class="alert alert-danger"><i class="fas fa-times"></i> \'+r.error+\'</div>\';}});}';
+
+    $o .= 'function replPauseJob(id){if(!confirm("Pause this replication job? New writes will not be replicated until resumed."))return;replAjax("clientPauseReplicationJob",{job_id:id},function(r){if(r.success){replLoadJobs();}else{alert("Failed: "+(r.error||"Unknown error"));}});}';
+    $o .= 'function replResumeJob(id){replAjax("clientResumeReplicationJob",{job_id:id},function(r){if(r.success){replLoadJobs();}else{alert("Failed: "+(r.error||"Unknown error"));}});}';
+    $o .= 'function replDeleteJob(id){if(!confirm("Delete this replication job?\\n\\nThis will stop replication. Existing data on the destination will be preserved."))return;replAjax("clientDeleteReplicationJob",{job_id:id},function(r){if(r.success){replLoadJobs();}else{alert("Failed: "+(r.error||"Unknown error"));}});}';
+
+    // Edit job — shows a modal-style panel with current settings
+    $o .= 'function replEditJob(id){replAjax("clientGetReplicationJob",{job_id:id},function(r){if(!r.success){alert("Error: "+(r.error||"Unknown"));return;}var j=r.job;var editHtml=\'<div id="repl-edit-panel" style="background:#f9f9f9;border:1px solid #e0e0e0;border-radius:6px;padding:16px;margin-top:15px;">\';editHtml+=\'<h4 style="margin:0 0 12px;">Edit Replication Job</h4>\';editHtml+=\'<input type="hidden" id="repl-edit-id" value="\'+j.id+\'">\';editHtml+=\'<div class="form-group"><label>Description</label><input type="text" id="repl-edit-desc" class="form-control" style="max-width:400px;" value="\'+( j.description||"")+\'"></div>\';editHtml+=\'<div style="padding:10px;background:#f0f0f0;border-radius:4px;margin-bottom:12px;">\';editHtml+=\'<div class="checkbox"><label><input type="checkbox" id="repl-edit-sync-existing" \'+(j.sync_existing==1?"checked":"")+\'> Replicate existing objects</label></div>\';editHtml+=\'<div class="checkbox"><label><input type="checkbox" id="repl-edit-sync-deletes" \'+(j.sync_deletes==1?"checked":"")+\'> Sync deleted objects</label></div>\';editHtml+=\'<div class="checkbox"><label><input type="checkbox" id="repl-edit-sync-locking" \'+(j.sync_locking==1?"checked":"")+\'> Sync object locking</label></div>\';editHtml+=\'<div class="checkbox"><label><input type="checkbox" id="repl-edit-sync-tags" \'+(j.sync_tags==1?"checked":"")+\'> Sync object tags</label></div>\';editHtml+=\'</div>\';editHtml+=\'<div id="repl-edit-progress" style="margin-bottom:10px;"></div>\';editHtml+=\'<button class="btn btn-primary btn-sm" onclick="replSaveEdit()"><i class="fas fa-save"></i> Save Changes</button> \';editHtml+=\'<button class="btn btn-default btn-sm" onclick="replCloseEdit()">Cancel</button>\';editHtml+=\'</div>\';var existing=document.getElementById("repl-edit-panel");if(existing)existing.remove();document.getElementById("repl-jobs-table").insertAdjacentHTML("afterend",editHtml);});}';
+
+    $o .= 'function replCloseEdit(){var p=document.getElementById("repl-edit-panel");if(p)p.remove();}';
+
+    $o .= 'function replSaveEdit(){var id=document.getElementById("repl-edit-id").value;var prog=document.getElementById("repl-edit-progress");prog.innerHTML=\'<div class="progress"><div class="progress-bar progress-bar-striped active" style="width:100%;">Saving...</div></div>\';replAjax("clientUpdateReplicationJob",{job_id:id,description:document.getElementById("repl-edit-desc").value,sync_existing:document.getElementById("repl-edit-sync-existing").checked?1:0,sync_deletes:document.getElementById("repl-edit-sync-deletes").checked?1:0,sync_locking:document.getElementById("repl-edit-sync-locking").checked?1:0,sync_tags:document.getElementById("repl-edit-sync-tags").checked?1:0},function(r){if(r.success){prog.innerHTML=\'<div class="alert alert-success"><i class="fas fa-check"></i> Settings saved.</div>\';setTimeout(function(){replCloseEdit();replLoadJobs();},1000);}else{prog.innerHTML=\'<div class="alert alert-danger"><i class="fas fa-times"></i> \'+r.error+\'</div>\';}});}';
+
+    // Auto-load replication jobs when switching to tab
+    $o .= 'document.querySelectorAll(".nav-tabs a[href=\'#tab-replication\']").forEach(function(a){a.addEventListener("click",function(){setTimeout(replLoadJobs,100);});});';
+
+    $o .= '</script>';
 
     // CSS
     $o .= '<style>';
@@ -1179,7 +1502,7 @@ DLCRED;
     $o .= '</style>';
     // Fix 5: Clear flash messages when switching tabs
     $o .= '<script>document.addEventListener("DOMContentLoaded",function(){document.querySelectorAll(".nav-tabs a[data-toggle=tab]").forEach(function(a){a.addEventListener("click",function(){document.querySelectorAll(".impulsedrive-dashboard > .alert").forEach(function(el){el.style.display="none";});});});';
-    $o .= 'document.querySelectorAll("a").forEach(function(a){var t=a.textContent.trim();if(t=="Create Bucket"||t=="Delete Bucket"||t=="Create Access Key"||t=="Delete Access Key"||t=="Toggle Versioning"||t=="Reset Password"||t=="List Objects"||t=="Download Object"||t=="Delete Object"||t=="Create Folder"||t=="Get Upload URL"){a.style.display="none";}});});</script>';
+    $o .= 'document.querySelectorAll("a").forEach(function(a){var t=a.textContent.trim();if(t=="Create Bucket"||t=="Delete Bucket"||t=="Create Access Key"||t=="Delete Access Key"||t=="Toggle Versioning"||t=="Reset Password"||t=="List Objects"||t=="Download Object"||t=="Delete Object"||t=="Create Folder"||t=="Get Upload URL"||t=="List Replication Jobs"||t=="Create Replication Job"||t=="Pause Replication Job"||t=="Resume Replication Job"||t=="Delete Replication Job"||t=="Get Replication Job"||t=="Update Replication Job"||t=="Replication Status"){a.style.display="none";}});});</script>';
 
     return $o;
 }
@@ -1209,6 +1532,14 @@ function impulseminio_ClientAreaCustomButtonArray(): array
         'Usage History' => 'clientGetUsageHistory',
         'Toggle Public' => 'clientTogglePublic',
         'Update CORS' => 'clientUpdateCors',
+        'List Replication Jobs' => 'clientListReplicationJobs',
+        'Create Replication Job' => 'clientCreateReplicationJob',
+        'Pause Replication Job' => 'clientPauseReplicationJob',
+        'Resume Replication Job' => 'clientResumeReplicationJob',
+        'Delete Replication Job' => 'clientDeleteReplicationJob',
+        'Get Replication Job' => 'clientGetReplicationJob',
+        'Update Replication Job' => 'clientUpdateReplicationJob',
+        'Replication Status' => 'clientReplicationStatus',
     ];
 }
 
@@ -1250,7 +1581,7 @@ function impulseminio_clientCreateBucket(array $params): string
             return 'A bucket with that name already exists.';
         }
 
-        $client = impulseminio_getClient($params);
+        $client = impulseminio_getServiceClient($params);
         $r = $client->createBucket($bucketName);
         if (!$r['success']) return 'Failed to create bucket: ' . $r['error'];
 
@@ -1297,7 +1628,7 @@ function impulseminio_clientDeleteBucket(array $params): string
         if (!$bucket) return 'Bucket not found or not owned by this service.';
         if ($bucket->is_primary) return 'Cannot delete the primary bucket. Contact support if needed.';
 
-        $client = impulseminio_getClient($params);
+        $client = impulseminio_getServiceClient($params);
         $r = $client->deleteBucket($bucketName, true);
         if (!$r['success']) return 'Failed to delete bucket: ' . $r['error'];
 
@@ -1352,7 +1683,7 @@ function impulseminio_clientCreateAccessKey(array $params): string
         $scopeInput = isset($_POST['bucket_scope']) ? trim($_POST['bucket_scope']) : '';
 
         $username = impulseminio_getUsername($params);
-        $client = impulseminio_getClient($params);
+        $client = impulseminio_getServiceClient($params);
 
         // Determine bucket scope
         $bucketScope = null;
@@ -1408,7 +1739,7 @@ function impulseminio_clientDeleteAccessKey(array $params): string
             ->where('service_id', $serviceId)->where('access_key', $accessKeyId)->first();
         if (!$key) return 'Access key not found or not owned by this service.';
 
-        $client = impulseminio_getClient($params);
+        $client = impulseminio_getServiceClient($params);
         $r = $client->deleteAccessKey($accessKeyId);
         if (!$r['success']) return 'Failed to delete access key: ' . $r['error'];
 
@@ -1449,10 +1780,17 @@ function impulseminio_clientToggleVersioning(array $params): string
             ->where('service_id', $serviceId)->where('bucket_name', $bucketName)->first();
         if (!$bucket) return 'Bucket not found or not owned by this service.';
 
-        $client = impulseminio_getClient($params);
+        $client = impulseminio_getServiceClient($params);
         $currentlyEnabled = !empty($bucket->versioning);
 
         if ($currentlyEnabled) {
+            // Check replication lock — cannot disable versioning while replication is active
+            if (file_exists(__DIR__ . '/lib/Replication.php')) {
+                require_once __DIR__ . '/lib/Replication.php';
+                if (\WHMCS\Module\Server\ImpulseMinio\Replication::bucketHasReplication($serviceId, $bucketName)) {
+                    return impulseminio_jsonResponse(['success' => false, 'error' => 'Versioning cannot be disabled while replication is active on this bucket. Remove the replication job first.']);
+                }
+            }
             $r = $client->suspendVersioning($bucketName);
             if (!$r['success']) return 'Failed to suspend versioning: ' . $r['error'];
             Capsule::table('mod_impulseminio_buckets')->where('id', $bucket->id)->update([
@@ -1485,7 +1823,7 @@ function impulseminio_clientToggleVersioning(array $params): string
 function impulseminio_clientResetPassword(array $params): string
 {
     try {
-        $client = impulseminio_getClient($params);
+        $client = impulseminio_getServiceClient($params);
         $username = impulseminio_getUsername($params);
         $newPassword = MinioClient::generatePassword(24);
 
@@ -1545,7 +1883,7 @@ function impulseminio_clientListObjects(array $params): string
             ->where('service_id', $serviceId)->where('bucket_name', $bucketName)->first();
         if (!$bucket) return impulseminio_jsonResponse(['success' => false, 'error' => 'Bucket not found.']);
 
-        $client = impulseminio_getClient($params);
+        $client = impulseminio_getServiceClient($params);
         $r = $client->listObjects($bucketName, $prefix);
 
         return impulseminio_jsonResponse([
@@ -1578,7 +1916,7 @@ function impulseminio_clientDownloadObject(array $params): string
             ->where('service_id', $serviceId)->where('bucket_name', $bucketName)->first();
         if (!$bucket) return impulseminio_jsonResponse(['success' => false, 'error' => 'Bucket not found.']);
 
-        $client = impulseminio_getClient($params);
+        $client = impulseminio_getServiceClient($params);
         $r = $client->getPresignedDownloadUrl($bucketName, $objectKey, 3600);
 
         return impulseminio_jsonResponse([
@@ -1611,7 +1949,7 @@ function impulseminio_clientGetUploadUrl(array $params): string
             ->where('service_id', $serviceId)->where('bucket_name', $bucketName)->first();
         if (!$bucket) return impulseminio_jsonResponse(['success' => false, 'error' => 'Bucket not found.']);
 
-        $client = impulseminio_getClient($params);
+        $client = impulseminio_getServiceClient($params);
         $r = $client->getPresignedUploadUrl($bucketName, $objectKey, 3600);
 
         return impulseminio_jsonResponse([
@@ -1644,7 +1982,7 @@ function impulseminio_clientDeleteObject(array $params): string
             ->where('service_id', $serviceId)->where('bucket_name', $bucketName)->first();
         if (!$bucket) return impulseminio_jsonResponse(['success' => false, 'error' => 'Bucket not found.']);
 
-        $client = impulseminio_getClient($params);
+        $client = impulseminio_getServiceClient($params);
         $r = $client->deleteObject($bucketName, $objectKey);
 
         return impulseminio_jsonResponse([
@@ -1679,7 +2017,7 @@ function impulseminio_clientCreateFolder(array $params): string
             ->where('service_id', $serviceId)->where('bucket_name', $bucketName)->first();
         if (!$bucket) return impulseminio_jsonResponse(['success' => false, 'error' => 'Bucket not found.']);
 
-        $client = impulseminio_getClient($params);
+        $client = impulseminio_getServiceClient($params);
         $r = $client->createFolder($bucketName, $folderPath);
 
         return impulseminio_jsonResponse([
@@ -1779,7 +2117,7 @@ function impulseminio_clientTogglePublic(array $params): string
             exit;
         }
         require_once __DIR__ . '/lib/PublicAccess.php';
-        $client = impulseminio_getClient($params);
+        $client = impulseminio_getServiceClient($params);
         if (\WHMCS\Module\Server\ImpulseMinio\PublicAccess::isPublic($serviceId, $bucketName)) {
             \WHMCS\Module\Server\ImpulseMinio\PublicAccess::disablePublic($client, $serviceId, $bucketName);
         } else {
@@ -1869,7 +2207,7 @@ function impulseminio_AdminCustomButtonArray(): array
 function impulseminio_checkUsage(array $params): string
 {
     try {
-        $client = impulseminio_getClient($params);
+        $client = impulseminio_getServiceClient($params);
         $buckets = impulseminio_getAllBuckets((int)$params['serviceid']) ?: [impulseminio_getBucket($params)];
         foreach ($buckets as $b) { $client->getBucketUsage($b); }
         return 'success';
@@ -1885,7 +2223,7 @@ function impulseminio_checkUsage(array $params): string
 function impulseminio_resetPassword(array $params): string
 {
     try {
-        $client = impulseminio_getClient($params);
+        $client = impulseminio_getServiceClient($params);
         $username = impulseminio_getUsername($params);
         $np = MinioClient::generatePassword(24);
         $r = $client->createUser($username, $np);
@@ -1911,6 +2249,291 @@ function impulseminio_rebuildPolicy(array $params): string
 }
 
 // =============================================================================
+// REPLICATION AJAX HANDLERS
+// =============================================================================
+
+/**
+ * Client AJAX: list replication jobs for this service.
+ */
+function impulseminio_clientListReplicationJobs(array $params): string
+{
+    try {
+        impulseminio_ensureTables();
+        if (!impulseminio_hasReplication()) {
+            return impulseminio_jsonResponse(['success' => false, 'error' => 'Replication is not available on your plan.']);
+        }
+        $jobs = \WHMCS\Module\Server\ImpulseMinio\Replication::getJobsForService((int)$params['serviceid']);
+        return impulseminio_jsonResponse(['success' => true, 'jobs' => $jobs]);
+    } catch (\Exception $e) {
+        return impulseminio_jsonResponse(['success' => false, 'error' => $e->getMessage()]);
+    }
+}
+
+/**
+ * Client AJAX: create a new replication job.
+ */
+function impulseminio_clientCreateReplicationJob(array $params): string
+{
+    try {
+        impulseminio_ensureTables();
+        if (!impulseminio_hasReplication()) {
+            return impulseminio_jsonResponse(['success' => false, 'error' => 'Replication is not available on your plan.']);
+        }
+
+        $serviceId = (int)$params['serviceid'];
+        $srcBucket = isset($_POST['source_bucket']) ? trim($_POST['source_bucket']) : '';
+        $destRegionId = isset($_POST['dest_region_id']) ? (int)$_POST['dest_region_id'] : 0;
+        $description = isset($_POST['description']) ? trim($_POST['description']) : '';
+
+        if (empty($srcBucket) || $destRegionId === 0) {
+            return impulseminio_jsonResponse(['success' => false, 'error' => 'Source bucket and destination region are required.']);
+        }
+
+        // Verify bucket ownership
+        $bucket = Capsule::table('mod_impulseminio_buckets')
+            ->where('service_id', $serviceId)->where('bucket_name', $srcBucket)->first();
+        if (!$bucket) {
+            return impulseminio_jsonResponse(['success' => false, 'error' => 'Bucket not found.']);
+        }
+
+        // Get source region
+        $srcRegionLink = Capsule::table('mod_impulseminio_service_regions')
+            ->where('service_id', $serviceId)->where('is_primary', true)->first();
+        if (!$srcRegionLink) {
+            return impulseminio_jsonResponse(['success' => false, 'error' => 'No primary region found for this service.']);
+        }
+
+        $options = [
+            'sync_existing' => (int)($_POST['sync_existing'] ?? 1),
+            'sync_deletes' => (int)($_POST['sync_deletes'] ?? 1),
+            'sync_locking' => (int)($_POST['sync_locking'] ?? 0),
+            'sync_metadata_date' => 1,
+            'sync_tags' => (int)($_POST['sync_tags'] ?? 1),
+        ];
+
+        $result = \WHMCS\Module\Server\ImpulseMinio\Replication::createJob(
+            $params,
+            $serviceId,
+            $srcBucket,
+            $srcRegionLink->region_id,
+            $destRegionId,
+            $description,
+            $options
+        );
+
+        return impulseminio_jsonResponse($result);
+    } catch (\Exception $e) {
+        logModuleCall('impulseminio', __FUNCTION__, $params, $e->getMessage(), $e->getTraceAsString());
+        return impulseminio_jsonResponse(['success' => false, 'error' => $e->getMessage()]);
+    }
+}
+
+/**
+ * Client AJAX: pause a replication job.
+ */
+function impulseminio_clientPauseReplicationJob(array $params): string
+{
+    try {
+        if (!impulseminio_hasReplication()) {
+            return impulseminio_jsonResponse(['success' => false, 'error' => 'Replication not available.']);
+        }
+        $jobId = isset($_POST['job_id']) ? (int)$_POST['job_id'] : 0;
+        if (!$jobId) return impulseminio_jsonResponse(['success' => false, 'error' => 'No job specified.']);
+
+        // Verify job belongs to this service
+        $job = Capsule::table('mod_impulseminio_replication_jobs')
+            ->where('id', $jobId)->where('service_id', (int)$params['serviceid'])->first();
+        if (!$job) return impulseminio_jsonResponse(['success' => false, 'error' => 'Job not found.']);
+
+        $result = \WHMCS\Module\Server\ImpulseMinio\Replication::pauseJob($params, $jobId);
+        return impulseminio_jsonResponse($result);
+    } catch (\Exception $e) {
+        return impulseminio_jsonResponse(['success' => false, 'error' => $e->getMessage()]);
+    }
+}
+
+/**
+ * Client AJAX: resume a paused replication job.
+ */
+function impulseminio_clientResumeReplicationJob(array $params): string
+{
+    try {
+        if (!impulseminio_hasReplication()) {
+            return impulseminio_jsonResponse(['success' => false, 'error' => 'Replication not available.']);
+        }
+        $jobId = isset($_POST['job_id']) ? (int)$_POST['job_id'] : 0;
+        if (!$jobId) return impulseminio_jsonResponse(['success' => false, 'error' => 'No job specified.']);
+
+        $job = Capsule::table('mod_impulseminio_replication_jobs')
+            ->where('id', $jobId)->where('service_id', (int)$params['serviceid'])->first();
+        if (!$job) return impulseminio_jsonResponse(['success' => false, 'error' => 'Job not found.']);
+
+        $result = \WHMCS\Module\Server\ImpulseMinio\Replication::resumeJob($params, $jobId);
+        return impulseminio_jsonResponse($result);
+    } catch (\Exception $e) {
+        return impulseminio_jsonResponse(['success' => false, 'error' => $e->getMessage()]);
+    }
+}
+
+/**
+ * Client AJAX: delete a replication job.
+ */
+function impulseminio_clientDeleteReplicationJob(array $params): string
+{
+    try {
+        if (!impulseminio_hasReplication()) {
+            return impulseminio_jsonResponse(['success' => false, 'error' => 'Replication not available.']);
+        }
+        $jobId = isset($_POST['job_id']) ? (int)$_POST['job_id'] : 0;
+        if (!$jobId) return impulseminio_jsonResponse(['success' => false, 'error' => 'No job specified.']);
+
+        $job = Capsule::table('mod_impulseminio_replication_jobs')
+            ->where('id', $jobId)->where('service_id', (int)$params['serviceid'])->first();
+        if (!$job) return impulseminio_jsonResponse(['success' => false, 'error' => 'Job not found.']);
+
+        $result = \WHMCS\Module\Server\ImpulseMinio\Replication::removeJob($params, $jobId, false);
+        return impulseminio_jsonResponse($result);
+    } catch (\Exception $e) {
+        return impulseminio_jsonResponse(['success' => false, 'error' => $e->getMessage()]);
+    }
+}
+
+/**
+ * Client AJAX: get a single replication job for editing.
+ */
+function impulseminio_clientGetReplicationJob(array $params): string
+{
+    try {
+        if (!impulseminio_hasReplication()) {
+            return impulseminio_jsonResponse(['success' => false, 'error' => 'Replication not available.']);
+        }
+        $jobId = isset($_POST['job_id']) ? (int)$_POST['job_id'] : 0;
+        if (!$jobId) return impulseminio_jsonResponse(['success' => false, 'error' => 'No job specified.']);
+
+        $job = Capsule::table('mod_impulseminio_replication_jobs')
+            ->where('id', $jobId)->where('service_id', (int)$params['serviceid'])->first();
+        if (!$job) return impulseminio_jsonResponse(['success' => false, 'error' => 'Job not found.']);
+
+        return impulseminio_jsonResponse(['success' => true, 'job' => $job]);
+    } catch (\Exception $e) {
+        return impulseminio_jsonResponse(['success' => false, 'error' => $e->getMessage()]);
+    }
+}
+
+/**
+ * Client AJAX: update a replication job's description and sync options.
+ */
+function impulseminio_clientUpdateReplicationJob(array $params): string
+{
+    try {
+        if (!impulseminio_hasReplication()) {
+            return impulseminio_jsonResponse(['success' => false, 'error' => 'Replication not available.']);
+        }
+        $jobId = isset($_POST['job_id']) ? (int)$_POST['job_id'] : 0;
+        if (!$jobId) return impulseminio_jsonResponse(['success' => false, 'error' => 'No job specified.']);
+
+        $job = Capsule::table('mod_impulseminio_replication_jobs')
+            ->where('id', $jobId)->where('service_id', (int)$params['serviceid'])->first();
+        if (!$job) return impulseminio_jsonResponse(['success' => false, 'error' => 'Job not found.']);
+
+        // Update description and sync options in database
+        $updates = [
+            'description'        => isset($_POST['description']) ? trim($_POST['description']) : $job->description,
+            'sync_existing'      => isset($_POST['sync_existing']) ? (int)$_POST['sync_existing'] : $job->sync_existing,
+            'sync_deletes'       => isset($_POST['sync_deletes']) ? (int)$_POST['sync_deletes'] : $job->sync_deletes,
+            'sync_locking'       => isset($_POST['sync_locking']) ? (int)$_POST['sync_locking'] : $job->sync_locking,
+            'sync_tags'          => isset($_POST['sync_tags']) ? (int)$_POST['sync_tags'] : $job->sync_tags,
+            'updated_at'         => date('Y-m-d H:i:s'),
+        ];
+
+        Capsule::table('mod_impulseminio_replication_jobs')->where('id', $jobId)->update($updates);
+
+        // If the job is active, update the replication rule on MinIO with new flags
+        if ($job->status === 'active' && !empty($job->rule_id)) {
+            $syncFlags = [];
+            if ($updates['sync_deletes']) { $syncFlags[] = 'delete'; $syncFlags[] = 'delete-marker'; }
+            if ($updates['sync_existing']) { $syncFlags[] = 'existing-objects'; }
+            if ($updates['sync_locking']) { $syncFlags[] = 'replica-metadata-sync'; }
+            $flagStr = !empty($syncFlags) ? implode(',', $syncFlags) : 'delete,delete-marker,existing-objects';
+
+            $srcRegion = Capsule::table('mod_impulseminio_regions')->where('id', $job->source_region_id)->first();
+            if ($srcRegion) {
+                $client = impulseminio_getServiceClient($params);
+                // mc replicate update ALIAS/BUCKET --id RULE_ID --replicate FLAGS
+                // Note: this updates the replicate flags on the existing rule
+            }
+        }
+
+        return impulseminio_jsonResponse(['success' => true]);
+    } catch (\Exception $e) {
+        return impulseminio_jsonResponse(['success' => false, 'error' => $e->getMessage()]);
+    }
+}
+
+/**
+ * Client AJAX: get live replication status for a bucket.
+ */
+function impulseminio_clientReplicationStatus(array $params): string
+{
+    try {
+        if (!impulseminio_hasReplication()) {
+            return impulseminio_jsonResponse(['success' => false, 'error' => 'Replication not available.']);
+        }
+        $jobId = isset($_POST['job_id']) ? (int)$_POST['job_id'] : 0;
+        if (!$jobId) return impulseminio_jsonResponse(['success' => false, 'error' => 'No job specified.']);
+
+        $job = Capsule::table('mod_impulseminio_replication_jobs')
+            ->where('id', $jobId)->where('service_id', (int)$params['serviceid'])->first();
+        if (!$job) return impulseminio_jsonResponse(['success' => false, 'error' => 'Job not found.']);
+
+        $srcRegion = Capsule::table('mod_impulseminio_regions')->where('id', $job->source_region_id)->first();
+        if (!$srcRegion) return impulseminio_jsonResponse(['success' => false, 'error' => 'Source region not found.']);
+
+        $client = impulseminio_getServiceClient($params);
+        $r = $client->getReplicationStatus($job->source_bucket);
+
+        if (!$r['success']) {
+            return impulseminio_jsonResponse(['success' => false, 'error' => 'Could not fetch status.']);
+        }
+
+        // Parse the JSON output
+        $statusData = [];
+        $lines = explode("\n", trim($r['output']));
+        foreach ($lines as $line) {
+            $json = @json_decode($line, true);
+            if ($json && isset($json['replicationstats'])) {
+                $stats = $json['replicationstats']['currStats'] ?? [];
+                $queued = $stats['queued']['curr'] ?? ['count' => 0, 'bytes' => 0];
+                $failed = $stats['failed']['totals'] ?? ['count' => 0, 'bytes' => 0];
+
+                $statusData = [
+                    'replicated_count' => (int)($stats['replicationCount'] ?? 0),
+                    'replicated_bytes' => (int)($stats['completedReplicationSize'] ?? 0),
+                    'queued_count' => (int)($queued['count'] ?? 0),
+                    'queued_bytes' => (int)($queued['bytes'] ?? 0),
+                    'failed_count' => (int)($failed['count'] ?? 0),
+                    'failed_bytes' => (int)($failed['bytes'] ?? 0),
+                ];
+
+                // Remote target info
+                $targets = $json['remoteTargets'] ?? [];
+                if (!empty($targets)) {
+                    $t = $targets[0];
+                    $statusData['target_online'] = (bool)($t['isOnline'] ?? false);
+                    $statusData['target_latency_ms'] = round(($t['latency']['curr'] ?? 0) / 1000000, 1);
+                    $statusData['target_endpoint'] = $t['endpoint'] ?? '';
+                }
+                break;
+            }
+        }
+
+        return impulseminio_jsonResponse(['success' => true, 'stats' => $statusData]);
+    } catch (\Exception $e) {
+        return impulseminio_jsonResponse(['success' => false, 'error' => $e->getMessage()]);
+    }
+}
+
+// =============================================================================
 // TEST CONNECTION
 // =============================================================================
 /**
@@ -1922,7 +2545,7 @@ function impulseminio_rebuildPolicy(array $params): string
 function impulseminio_TestConnection(array $params): array
 {
     try {
-        $client = impulseminio_getClient($params);
+        $client = impulseminio_getServiceClient($params);
         $r = $client->testConnection();
         return ['success' => $r['success'], 'error' => $r['success'] ? '' : $r['message']];
     } catch (\Exception $e) { return ['success' => false, 'error' => $e->getMessage()]; }

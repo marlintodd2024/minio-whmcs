@@ -2,6 +2,7 @@ parameters:
     level: 5
     paths:
         - modules/servers/impulseminio
+        - modules/addons/impulseminio_addon
         - includes/hooks
     excludePaths:
         - modules/servers/impulseminio/templates
@@ -16,7 +17,13 @@ parameters:
             message: '#Function encrypt not found#'
             reportUnmatched: false
         -
+            message: '#Function decrypt not found#'
+            reportUnmatched: false
+        -
             message: '#Function add_hook not found#'
+            reportUnmatched: false
+        -
+            message: '#Function localAPI not found#'
             reportUnmatched: false
         -
             message: '#has invalid type WHMCS#'

@@ -1,8 +1,9 @@
 <?php
 /**
- * Impulse Hosting - MinIO Client Library v1.1
+ * Impulse Hosting - MinIO Client Library v1.2
  * Wraps MinIO mc CLI for the WHMCS provisioning module.
- * Supports multi-bucket policies and service account (access key) management.
+ * Supports multi-bucket policies, service account management,
+ * and multi-region connections via unique per-endpoint aliases.
  * @package ImpulseMinio
  */
 namespace WHMCS\Module\Server\ImpulseMinio;
@@ -503,6 +504,175 @@ class MinioClient
     {
         $this->ensureAlias();
         $r = $this->mc('anonymous get', [$this->mcAlias . '/' . $bucketName]);
+        return ['success' => $r['success'], 'output' => $r['output']];
+    }
+
+    // === REPLICATION ===
+
+    /**
+     * Add a remote replication target (deprecated — use addReplicationWithTarget).
+     * Kept for backward compatibility.
+     *
+     * @return array{success: bool, arn?: string, error?: string}
+     */
+    public function addRemoteTarget(string $srcBucket, string $destEndpoint, string $destBucket, string $accessKey, string $secretKey): array
+    {
+        // New mc versions handle remote target creation inline via mc replicate add
+        // Store the target URL for use by addReplicationRule
+        return [
+            'success' => true,
+            'arn' => '',
+            'target_url' => $destEndpoint,
+            'dest_bucket' => $destBucket,
+            'access_key' => $accessKey,
+            'secret_key' => $secretKey,
+        ];
+    }
+
+    /**
+     * Remove a remote replication target.
+     */
+    public function removeRemoteTarget(string $bucket, string $arn): array
+    {
+        if (empty($arn)) return ['success' => true, 'output' => 'No ARN to remove'];
+        $this->ensureAlias();
+        $r = $this->mc('admin bucket remote rm', [$this->mcAlias . '/' . $bucket, '--arn', $arn]);
+        return ['success' => $r['success'], 'output' => $r['output']];
+    }
+
+    /**
+     * Add a replication rule with inline remote target (new mc syntax).
+     *
+     * Uses: mc replicate add ALIAS/BUCKET --remote-bucket https://USER:SECRET@ENDPOINT/DESTBUCKET --replicate FLAGS
+     *
+     * @return array{success: bool, rule_id?: string, error?: string}
+     */
+    public function addReplicationRule(string $bucket, string $remoteArn, string $replicateFlags = 'delete,delete-marker,existing-objects'): array
+    {
+        $this->ensureAlias();
+
+        // If remoteArn is a URL (new style), use it directly
+        // If it's an actual ARN (old style), use that
+        $remoteBucket = $remoteArn;
+
+        $r = $this->mc('replicate add', [
+            $this->mcAlias . '/' . $bucket,
+            '--remote-bucket', $remoteBucket,
+            '--replicate', $replicateFlags,
+        ], true);
+
+        if (!$r['success']) {
+            return ['success' => false, 'error' => $r['output']];
+        }
+
+        // Parse rule ID from JSON output
+        $ruleId = '';
+        $lines = explode("\n", trim($r['output']));
+        foreach ($lines as $line) {
+            $json = @json_decode($line, true);
+            if (isset($json['id'])) {
+                $ruleId = $json['id'];
+                break;
+            }
+        }
+
+        return ['success' => true, 'rule_id' => $ruleId];
+    }
+
+    /**
+     * Create replication with remote target in one step.
+     *
+     * @return array{success: bool, rule_id?: string, error?: string}
+     */
+    public function addReplicationWithTarget(
+        string $srcBucket,
+        string $destEndpoint,
+        string $destBucket,
+        string $accessKey,
+        string $secretKey,
+        string $replicateFlags = 'delete,delete-marker,existing-objects'
+    ): array {
+        $this->ensureAlias();
+
+        // Build target URL: https://USER:SECRET@ENDPOINT/BUCKET
+        $parsed = parse_url($destEndpoint);
+        $scheme = $parsed['scheme'] ?? 'https';
+        $host = $parsed['host'] ?? '';
+        $port = isset($parsed['port']) ? ':' . $parsed['port'] : '';
+        $targetUrl = $scheme . '://' . $accessKey . ':' . $secretKey . '@' . $host . $port . '/' . $destBucket;
+
+        $r = $this->mc('replicate add', [
+            $this->mcAlias . '/' . $srcBucket,
+            '--remote-bucket', $targetUrl,
+            '--replicate', $replicateFlags,
+        ], true);
+
+        if (!$r['success']) {
+            return ['success' => false, 'error' => $r['output']];
+        }
+
+        $ruleId = '';
+        $lines = explode("\n", trim($r['output']));
+        foreach ($lines as $line) {
+            $json = @json_decode($line, true);
+            if (isset($json['id'])) {
+                $ruleId = $json['id'];
+                break;
+            }
+        }
+
+        return ['success' => true, 'rule_id' => $ruleId];
+    }
+
+    /**
+     * Update a replication rule state (enable/disable).
+     */
+    public function updateReplicationRule(string $bucket, string $ruleId, string $state): array
+    {
+        $this->ensureAlias();
+        $r = $this->mc('replicate update', [
+            $this->mcAlias . '/' . $bucket,
+            '--id', $ruleId,
+            '--state', $state,
+        ]);
+        return ['success' => $r['success'], 'output' => $r['output']];
+    }
+
+    /**
+     * Remove a replication rule.
+     */
+    public function removeReplicationRule(string $bucket, string $ruleId): array
+    {
+        $this->ensureAlias();
+        $r = $this->mc('replicate rm', [$this->mcAlias . '/' . $bucket, '--id', $ruleId]);
+        return ['success' => $r['success'], 'output' => $r['output']];
+    }
+
+    /**
+     * Get replication status for a bucket.
+     */
+    public function getReplicationStatus(string $bucket): array
+    {
+        $this->ensureAlias();
+        $r = $this->mc('replicate status', [$this->mcAlias . '/' . $bucket], true);
+        if (!$r['success']) return ['success' => false, 'output' => $r['output']];
+
+        $status = [];
+        $lines = explode("\n", trim($r['output']));
+        foreach ($lines as $line) {
+            $json = @json_decode($line, true);
+            if ($json) $status[] = $json;
+        }
+        return ['success' => true, 'rules' => $status, 'output' => $r['output']];
+    }
+
+    /**
+     * Force-remove a bucket and all contents.
+     */
+    public function removeBucketForce(string $bucketName): array
+    {
+        $this->ensureAlias();
+        $r = $this->mc('rb', [$this->mcAlias . '/' . $bucketName, '--force']);
         return ['success' => $r['success'], 'output' => $r['output']];
     }
 }
