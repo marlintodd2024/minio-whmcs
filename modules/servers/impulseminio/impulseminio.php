@@ -181,6 +181,19 @@ function impulseminio_hasReplication(): bool
     return \WHMCS\Module\Server\ImpulseMinio\Premium::hasFeature('replication');
 }
 
+function impulseminio_hasCustomDomains(): bool
+{
+    if (!impulseminio_hasPremium()) return false;
+    require_once __DIR__ . '/lib/Premium.php';
+    return \WHMCS\Module\Server\ImpulseMinio\Premium::hasFeature('custom_domain');
+}
+function impulseminio_hasMigration(): bool
+{
+    if (!impulseminio_hasPremium()) return false;
+    require_once __DIR__ . '/lib/Premium.php';
+    return \WHMCS\Module\Server\ImpulseMinio\Premium::hasFeature('migration');
+}
+
 // =============================================================================
 // METADATA & CONFIG
 // =============================================================================
@@ -1155,6 +1168,109 @@ function impulseminio_renderClientArea(array $params = []): string
     $o .= '<small class="text-muted"><i class="fas fa-clock"></i> Last updated: ' . $lastUpdate . '</small>';
     $o .= '</div></div>';
 
+
+    // === MIGRATION CARDS (Overview tab) ===
+    if (impulseminio_hasMigration()) {
+        require_once __DIR__ . '/lib/Migration.php';
+        $migrations = \WHMCS\Module\Server\ImpulseMinio\Migration::getServiceMigrations($serviceId);
+        $activeMigrations = array_filter($migrations, function($m) { return in_array($m->status, ['pending', 'scanning', 'running']); });
+        $completedMigrations = array_filter($migrations, function($m) { return in_array($m->status, ['complete', 'error', 'cancelled', 'interrupted']); });
+
+        // Active migration progress cards
+        foreach ($activeMigrations as $mig) {
+            $pct = ($mig->total_bytes > 0) ? min(100, round(($mig->migrated_bytes / $mig->total_bytes) * 100, 1)) : 0;
+            $providerLabel = \WHMCS\Module\Server\ImpulseMinio\Migration::PROVIDERS[$mig->provider]['label'] ?? ucfirst($mig->provider);
+            $migBytes = \WHMCS\Module\Server\ImpulseMinio\Migration::formatBytes((int)$mig->migrated_bytes);
+            $totalBytes = \WHMCS\Module\Server\ImpulseMinio\Migration::formatBytes((int)$mig->total_bytes);
+            $o .= '<div class="panel panel-info" id="mig-card-' . (int)$mig->id . '"><div class="panel-heading"><h3 class="panel-title"><i class="fas fa-sync-alt fa-spin"></i> Migration: ' . $esc($providerLabel) . ' &rarr; ' . $esc($mig->dest_bucket) . '</h3></div>';
+            $o .= '<div class="panel-body">';
+            $o .= '<div class="progress" style="height:22px;margin-bottom:8px;"><div class="progress-bar progress-bar-info progress-bar-striped active" id="mig-bar-' . (int)$mig->id . '" style="width:' . $pct . '%;min-width:2em;line-height:22px;">' . $pct . '%</div></div>';
+            $o .= '<p class="text-muted" id="mig-detail-' . (int)$mig->id . '">' . (int)$mig->migrated_objects . ' / ' . (int)$mig->total_objects . ' objects &middot; ' . $migBytes . ' of ' . $totalBytes . '</p>';
+            $o .= '<p class="text-muted" style="font-size:12px;">Started: ' . $esc($mig->started_at ?? '') . '</p>';
+            $o .= '<button class="btn btn-danger btn-xs" onclick="migCancel(' . (int)$mig->id . ')"><i class="fas fa-times"></i> Cancel Migration</button>';
+            $o .= '</div></div>';
+        }
+
+        // Completed migration cards
+        foreach ($completedMigrations as $mig) {
+            $providerLabel = \WHMCS\Module\Server\ImpulseMinio\Migration::PROVIDERS[$mig->provider]['label'] ?? ucfirst($mig->provider);
+            $icon = $mig->status === 'complete' ? '<i class="fas fa-check-circle text-success"></i>' : '<i class="fas fa-exclamation-circle text-danger"></i>';
+            $statusLabel = ucfirst($mig->status);
+            $totalBytes = \WHMCS\Module\Server\ImpulseMinio\Migration::formatBytes((int)$mig->total_bytes);
+            $o .= '<div class="panel panel-default"><div class="panel-heading"><h3 class="panel-title">' . $icon . ' ' . $statusLabel . ': ' . $esc($providerLabel) . ' &rarr; ' . $esc($mig->dest_bucket) . '</h3></div>';
+            $o .= '<div class="panel-body">';
+            $o .= '<p>' . (int)$mig->migrated_objects . ' objects &middot; ' . $totalBytes . ' &middot; ' . $statusLabel . '</p>';
+            if (!empty($mig->error_message)) $o .= '<p class="text-danger" style="font-size:13px;">' . $esc($mig->error_message) . '</p>';
+            if (!empty($mig->completed_at)) $o .= '<p class="text-muted" style="font-size:12px;">Completed: ' . $esc($mig->completed_at) . '</p>';
+            $o .= '<button class="btn btn-default btn-xs" onclick="migDismiss(' . (int)$mig->id . ')"><i class="fas fa-times"></i> Dismiss</button>';
+            $o .= '</div></div>';
+        }
+
+        // Migrate Data button + wizard modal trigger
+        if (empty($activeMigrations)) {
+            $o .= '<div style="margin-top:15px;"><button class="btn btn-primary btn-sm" onclick="document.getElementById(\'migWizard\').style.display=\'block\';migStep(1);"><i class="fas fa-cloud-download-alt"></i> Migrate Data</button></div>';
+        }
+
+        // Migration wizard (hidden by default)
+        $providers = \WHMCS\Module\Server\ImpulseMinio\Migration::getProviders();
+        $providerOptions = '';
+        foreach ($providers as $pk => $pv) {
+            $providerOptions .= '<option value="' . $esc($pk) . '" data-regions="' . $esc(json_encode($pv['regions'])) . '" data-region-required="' . ($pv['region_required'] ? '1' : '0') . '" data-custom-endpoint="' . (($pv['custom_endpoint'] ?? false) ? '1' : '0') . '">' . $esc($pv['label']) . '</option>';
+        }
+        $destBucketOptions = '';
+        foreach ($buckets as $b) {
+            $destBucketOptions .= '<option value="' . $esc($b->bucket_name) . '">' . $esc($b->bucket_name) . '</option>';
+        }
+
+        $o .= '<div id="migWizard" style="display:none;margin-top:20px;">';
+        $o .= '<div class="panel panel-primary"><div class="panel-heading"><h3 class="panel-title"><i class="fas fa-cloud-download-alt"></i> Migrate Data from Another Provider</h3></div>';
+        $o .= '<div class="panel-body">';
+
+        // Step 1: Configure Source
+        $o .= '<div id="migStep1">';
+        $o .= '<h4>Step 1: Configure Source</h4>';
+        $o .= '<div class="form-group"><label>Provider</label><select id="migProvider" class="form-control" onchange="migProviderChanged()">' . $providerOptions . '</select></div>';
+        $o .= '<div class="form-group" id="migRegionGroup" style="display:none;"><label>Region</label><select id="migRegion" class="form-control"></select></div>';
+        $o .= '<div class="form-group" id="migCustomEndpointGroup" style="display:none;"><label>S3 Endpoint URL</label><input type="text" id="migCustomEndpoint" class="form-control" placeholder="https://s3.example.com"></div>';
+        $o .= '<div class="form-group"><label>Access Key ID</label><input type="text" id="migAccessKey" class="form-control" placeholder="Your source provider access key"></div>';
+        $o .= '<div class="form-group"><label>Secret Access Key</label><input type="password" id="migSecretKey" class="form-control" placeholder="Your source provider secret key"></div>';
+        $o .= '<p class="text-muted" style="font-size:12px;"><i class="fas fa-shield-alt"></i> Your credentials are used only during the migration and are never stored permanently.</p>';
+        $o .= '<div id="migStep1Status"></div>';
+        $o .= '<button class="btn btn-primary" onclick="migValidateSource()"><i class="fas fa-plug"></i> Connect &amp; List Buckets</button>';
+        $o .= ' <button class="btn btn-default" onclick="document.getElementById(\'migWizard\').style.display=\'none\';">Cancel</button>';
+        $o .= '</div>';
+
+        // Step 2: Select Source Bucket
+        $o .= '<div id="migStep2" style="display:none;">';
+        $o .= '<h4>Step 2: Select Source Bucket</h4>';
+        $o .= '<div class="form-group"><label>Source Bucket</label><select id="migSourceBucket" class="form-control"></select></div>';
+        $o .= '<div id="migStep2Status"></div>';
+        $o .= '<button class="btn btn-primary" onclick="migScanBucket()"><i class="fas fa-search"></i> Scan Bucket</button>';
+        $o .= ' <button class="btn btn-default" onclick="migStep(1)">Back</button>';
+        $o .= '</div>';
+
+        // Step 3: Map Destination
+        $o .= '<div id="migStep3" style="display:none;">';
+        $o .= '<h4>Step 3: Choose Destination</h4>';
+        $o .= '<div class="well" id="migScanResult"></div>';
+        $o .= '<div class="form-group"><label>Destination Bucket</label><select id="migDestBucket" class="form-control">' . $destBucketOptions . '</select></div>';
+        $o .= '<div id="migStep3Status"></div>';
+        $o .= '<button class="btn btn-success" onclick="migStart()"><i class="fas fa-play"></i> Start Migration</button>';
+        $o .= ' <button class="btn btn-default" onclick="migStep(2)">Back</button>';
+        $o .= '</div>';
+
+        // Step 4: In Progress (replaces wizard)
+        $o .= '<div id="migStep4" style="display:none;">';
+        $o .= '<h4><i class="fas fa-sync-alt fa-spin"></i> Migration In Progress</h4>';
+        $o .= '<div class="progress" style="height:22px;"><div class="progress-bar progress-bar-info progress-bar-striped active" id="migWizardBar" style="width:0%;min-width:2em;line-height:22px;">0%</div></div>';
+        $o .= '<p class="text-muted" id="migWizardDetail">Starting...</p>';
+        $o .= '<p class="text-muted" style="font-size:12px;">You can close this panel. Migration continues in the background.</p>';
+        $o .= '<button class="btn btn-default btn-sm" onclick="location.reload();">Close</button>';
+        $o .= '</div>';
+
+        $o .= '</div></div></div>'; // end wizard panel
+    }
+
     $o .= '</div>'; // end overview tab
 
     // === BUCKETS TAB ===
@@ -1217,7 +1333,59 @@ function impulseminio_renderClientArea(array $params = []): string
             $o .= 'One origin per line. Must start with <code>http://</code> or <code>https://</code> (unless using <code>*</code>).';
             $o .= '</div>';
             $o .= '<div class="alert alert-info" style="margin-top:10px;margin-bottom:10px;padding:10px 12px;font-size:12px;"><i class="fas fa-globe" style="margin-right:6px;"></i><strong>Static Website Hosting:</strong> Upload an <code>index.html</code> file to your public bucket and it will automatically be served as the homepage when visitors access your public URL.</div>';
-            $o .= '<div style="display:flex;justify-content:flex-end;gap:8px;">';
+
+            // Custom Domain section (Everything tier only)
+            if (impulseminio_hasCustomDomains()) {
+                $cdInfo = \WHMCS\Module\Server\ImpulseMinio\PublicAccess::getCustomDomain($serviceId, $b->bucket_name);
+                $hasDomain = !empty($cdInfo['domain']);
+                $o .= '<div style="border-top:1px solid #e0e0e0;padding-top:12px;margin-top:12px;">';
+                $o .= '<label style="font-weight:600;font-size:13px;margin-bottom:8px;"><i class="fas fa-link"></i> Custom Domain</label>';
+                if ($hasDomain) {
+                    $statusColors = ['active' => '#28a745', 'pending' => '#ffc107', 'pending_validation' => '#ffc107', 'moved' => '#dc3545'];
+                    $statusLabels = ['active' => 'Active', 'pending' => 'Waiting for DNS', 'pending_validation' => 'Issuing Certificate', 'moved' => 'DNS Changed'];
+                    $sc = $statusColors[$cdInfo['cf_status']] ?? '#999';
+                    $sl = $statusLabels[$cdInfo['cf_status']] ?? ucfirst($cdInfo['cf_status'] ?? 'Unknown');
+                    $o .= '<div style="background:#f0f8ff;border:1px solid #d0e8ff;border-radius:4px;padding:10px 12px;margin-bottom:8px;">';
+                    $o .= '<div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;">';
+                    $o .= '<code style="font-size:13px;">' . $esc($cdInfo['domain']) . '</code>';
+                    $o .= '<span style="display:inline-block;width:8px;height:8px;border-radius:50%;background:' . $sc . ';"></span>';
+                    $o .= '<span style="font-size:12px;color:' . $sc . ';">' . $sl . '</span>';
+                    $o .= '</div>';
+                    if ($cdInfo['cf_status'] === 'pending' || $cdInfo['cf_status'] === 'pending_validation') {
+                        // Show CNAME instructions
+                        $cdnHost = '';
+                        if (!empty($primaryCdn)) {
+                            $cdnHost = $esc($b->bucket_name) . '.' . str_replace('https://', '', $esc($primaryCdn));
+                        }
+                        $o .= '<div style="margin-top:8px;font-size:12px;color:#555;">';
+                        if ($cdInfo['cf_status'] === 'pending') {
+                            $o .= '<strong>Step 1:</strong> Add this DNS record at your domain provider:<br>';
+                            $o .= '<code style="display:inline-block;margin:4px 0;padding:3px 8px;background:#f4f4f4;border-radius:3px;">CNAME ' . $esc($cdInfo['domain']) . ' &rarr; ' . $cdnHost . '</code><br>';
+                            $o .= '<span style="color:#888;">DNS changes can take a few minutes to propagate. Click "Check Status" after adding the record.</span>';
+                        } else {
+                            $o .= '<strong>Step 2:</strong> DNS verified. SSL certificate is being issued automatically.<br>';
+                            $o .= '<span style="color:#888;">This typically takes 2&ndash;15 minutes. No action needed &mdash; check back shortly.</span>';
+                        }
+                        $o .= '</div>';
+                        $o .= '<button class="btn btn-xs btn-default" style="margin-top:6px;" onclick="cdPollStatus(\'' . $bn . '\')"><i class="fas fa-sync-alt"></i> Check Status</button>';
+                    }
+                    if ($cdInfo['cf_status'] === 'active') {
+                        $o .= '<div style="margin-top:6px;font-size:12px;color:#28a745;"><i class="fas fa-check-circle"></i> Your custom domain is live. SSL certificate active.</div>';
+                    }
+                    $o .= '</div>';
+                    $o .= '<button class="btn btn-xs btn-danger" onclick="cdRemoveDomain(\'' . $bn . '\')"><i class="fas fa-times"></i> Remove Custom Domain</button>';
+                    $o .= ' <span id="cd-status-' . $bn . '" style="font-size:12px;"></span>';
+                } else {
+                    $o .= '<div style="margin-bottom:8px;">';
+                    $o .= '<div class="input-group" style="max-width:400px;"><input type="text" id="cd-input-' . $bn . '" class="form-control input-sm" placeholder="assets.yourdomain.com"><span class="input-group-btn"><button class="btn btn-primary btn-sm" onclick="cdAddDomain(\'' . $bn . '\')"><i class="fas fa-plus"></i> Add</button></span></div>';
+                    $o .= '<div class="text-muted" style="font-size:11px;margin-top:4px;">Enter your custom domain (e.g., assets.yourdomain.com). After adding, you\'ll need to create a CNAME record at your DNS provider. SSL is provisioned automatically &mdash; the full process typically takes 5&ndash;15 minutes.</div>';
+                    $o .= '</div>';
+                    $o .= '<span id="cd-status-' . $bn . '" style="font-size:12px;"></span>';
+                }
+                $o .= '</div>';
+            }
+
+            $o .= '<div style="display:flex;justify-content:flex-end;gap:8px;margin-top:12px;">';
             $o .= '<button class="btn btn-default btn-xs" onclick="toggleCorsPanel(\'' . $bn . '\')"><i class="fas fa-times"></i> Cancel</button>';
             $o .= '<button class="btn btn-primary btn-xs" onclick="saveCors(\'' . $bn . '\')"><i class="fas fa-save"></i> Save CORS</button>';
             $o .= '</div></div></td></tr>';
@@ -1694,6 +1862,36 @@ DLCRED;
     // Auto-load replication jobs when switching to tab
     $o .= 'document.querySelectorAll(".nav-tabs a[href=\'#tab-replication\']").forEach(function(a){a.addEventListener("click",function(){setTimeout(replLoadJobs,100);});});';
 
+    // Custom Domain JS
+    $o .= 'function cdAddDomain(bucket){var input=document.getElementById("cd-input-"+bucket);var domain=input?input.value.trim():"";if(!domain){alert("Enter a domain.");return;}var el=document.getElementById("cd-status-"+bucket);el.innerHTML=\'<span style="color:#888;"><i class="fas fa-spinner fa-spin"></i> Adding...</span>\';fbAjax("clientAddCustomDomain",{bucket_name:bucket,domain:domain},function(r){if(r.success){el.innerHTML=\'<span style="color:#28a745;"><i class="fas fa-check"></i> Domain added. Reload to see status.</span>\';setTimeout(function(){location.reload();},1500);}else{el.innerHTML=\'<span style="color:#dc3545;"><i class="fas fa-times"></i> \'+r.error+\'</span>\';}});}';
+    $o .= 'function cdRemoveDomain(bucket){if(!confirm("Remove custom domain from this bucket?"))return;var el=document.getElementById("cd-status-"+bucket);el.innerHTML=\'<span style="color:#888;"><i class="fas fa-spinner fa-spin"></i> Removing...</span>\';fbAjax("clientRemoveCustomDomain",{bucket_name:bucket},function(r){if(r.success){el.innerHTML=\'<span style="color:#28a745;"><i class="fas fa-check"></i> Removed.</span>\';setTimeout(function(){location.reload();},1500);}else{el.innerHTML=\'<span style="color:#dc3545;"><i class="fas fa-times"></i> \'+r.error+\'</span>\';}});}';
+    $o .= 'function cdPollStatus(bucket){var el=document.getElementById("cd-status-"+bucket);el.innerHTML=\'<span style="color:#888;"><i class="fas fa-spinner fa-spin"></i> Checking...</span>\';fbAjax("clientPollCustomDomain",{bucket_name:bucket},function(r){if(r.success){if(r.status==="active"){el.innerHTML=\'<span style="color:#28a745;"><i class="fas fa-check"></i> Active! Reloading...</span>\';setTimeout(function(){location.reload();},1500);}else{el.innerHTML=\'<span style="color:#e67e22;">Status: \'+r.status+\'</span>\';}}else{el.innerHTML=\'<span style="color:#dc3545;">\'+r.error+\'</span>\';}});}';
+
+    // Migration wizard JS
+    $o .= 'var migJobId=0;var migCredentials={};';
+    $o .= 'function migStep(n){document.getElementById("migStep1").style.display=n===1?"block":"none";document.getElementById("migStep2").style.display=n===2?"block":"none";document.getElementById("migStep3").style.display=n===3?"block":"none";document.getElementById("migStep4").style.display=n===4?"block":"none";}';
+    $o .= 'function migProviderChanged(){var sel=document.getElementById("migProvider");var opt=sel.options[sel.selectedIndex];var regions=JSON.parse(opt.getAttribute("data-regions")||"{}");var reqRegion=opt.getAttribute("data-region-required")==="1";var customEp=opt.getAttribute("data-custom-endpoint")==="1";document.getElementById("migRegionGroup").style.display=reqRegion?"block":"none";document.getElementById("migCustomEndpointGroup").style.display=customEp?"block":"none";var rSel=document.getElementById("migRegion");rSel.innerHTML="";for(var k in regions){var o=document.createElement("option");o.value=k;o.textContent=regions[k]+" ("+k+")";rSel.appendChild(o);}}';
+    $o .= 'migProviderChanged();'; // init on load
+    $o .= 'function migValidateSource(){var provider=document.getElementById("migProvider").value;var region=document.getElementById("migRegion").value;var customEp=document.getElementById("migCustomEndpoint").value;var ak=document.getElementById("migAccessKey").value;var sk=document.getElementById("migSecretKey").value;if(!ak||!sk){alert("Enter your access key and secret key.");return;}var el=document.getElementById("migStep1Status");el.innerHTML=\'<span style="color:#888;"><i class="fas fa-spinner fa-spin"></i> Connecting...</span>\';migCredentials={provider:provider,region:region,custom_endpoint:customEp,access_key:ak,secret_key:sk};fbAjax("clientValidateMigrationSource",{provider:provider,region:region,custom_endpoint:customEp,access_key:ak,secret_key:sk},function(r){if(r.success){el.innerHTML=\'<span style="color:#28a745;"><i class="fas fa-check"></i> Connected. \'+r.buckets.length+\' bucket(s) found.</span>\';var bSel=document.getElementById("migSourceBucket");bSel.innerHTML="";r.buckets.forEach(function(b){var o=document.createElement("option");o.value=b;o.textContent=b;bSel.appendChild(o);});setTimeout(function(){migStep(2);},500);}else{el.innerHTML=\'<span style="color:#dc3545;"><i class="fas fa-times"></i> \'+r.error+\'</span>\';}});}';
+    $o .= 'function migScanBucket(){var bucket=document.getElementById("migSourceBucket").value;if(!bucket){alert("Select a bucket.");return;}var el=document.getElementById("migStep2Status");el.innerHTML=\'<span style="color:#888;"><i class="fas fa-spinner fa-spin"></i> Scanning bucket size...</span>\';var p=Object.assign({},migCredentials,{source_bucket:bucket});fbAjax("clientScanMigrationBucket",p,function(r){if(r.success){el.innerHTML="";document.getElementById("migScanResult").innerHTML="<strong>"+bucket+"</strong>: "+r.total_objects+" objects, "+r.total_bytes_display;migCredentials.source_bucket=bucket;migCredentials.total_objects=r.total_objects;migCredentials.total_bytes=r.total_bytes;migStep(3);}else{el.innerHTML=\'<span style="color:#dc3545;">\'+r.error+\'</span>\';}});}';
+    $o .= 'function migStart(){var dest=document.getElementById("migDestBucket").value;if(!dest){alert("Select a destination bucket.");return;}var el=document.getElementById("migStep3Status");el.innerHTML=\'<span style="color:#888;"><i class="fas fa-spinner fa-spin"></i> Starting migration...</span>\';var p=Object.assign({},migCredentials,{dest_bucket:dest});fbAjax("clientStartMigration",p,function(r){if(r.success){migJobId=r.job_id;migStep(4);migPollProgress();}else{el.innerHTML=\'<span style="color:#dc3545;">\'+r.error+\'</span>\';}});}';
+    $o .= 'function migPollProgress(){if(!migJobId)return;fbAjax("clientMigrationProgress",{job_id:migJobId},function(r){if(r.success){var bar=document.getElementById("migWizardBar");var det=document.getElementById("migWizardDetail");if(bar){bar.style.width=r.percent+"%";bar.textContent=r.percent+"%";}if(det){det.textContent=r.migrated_objects+"/"+r.total_objects+" objects \u00b7 "+migFormatBytes(r.migrated_bytes)+" of "+migFormatBytes(r.total_bytes);}if(r.status==="running"){setTimeout(migPollProgress,5000);}else if(r.status==="complete"){bar.className="progress-bar progress-bar-success";bar.style.width="100%";bar.textContent="100%";det.textContent="Migration complete! "+r.migrated_objects+" objects transferred.";setTimeout(function(){location.reload();},3000);}else{bar.className="progress-bar progress-bar-danger";det.textContent="Status: "+r.status+(r.error_message?" - "+r.error_message:"");}}});}';
+    $o .= 'function migCancel(id){if(!confirm("Cancel this migration? Data already copied will remain."))return;fbAjax("clientCancelMigration",{job_id:id},function(r){if(r.success)location.reload();else alert(r.error||"Failed to cancel.");});}';
+    $o .= 'function migDismiss(id){fbAjax("clientDismissMigration",{job_id:id},function(r){if(r.success)location.reload();});}';
+    $o .= 'function migFormatBytes(b){if(b>=1099511627776)return(b/1099511627776).toFixed(2)+" TB";if(b>=1073741824)return(b/1073741824).toFixed(2)+" GB";if(b>=1048576)return(b/1048576).toFixed(2)+" MB";if(b>=1024)return(b/1024).toFixed(2)+" KB";return b+" B";}';
+    // Auto-poll active migrations on page load
+    $o .= 'document.addEventListener("DOMContentLoaded",function(){';
+    if (impulseminio_hasMigration()) {
+        require_once __DIR__ . '/lib/Migration.php';
+        $activeMigs = \WHMCS\Module\Server\ImpulseMinio\Migration::getServiceMigrations($serviceId);
+        foreach ($activeMigs as $am) {
+            if (in_array($am->status, ['running', 'scanning'])) {
+                $o .= '(function(id){setInterval(function(){fbAjax("clientMigrationProgress",{job_id:id},function(r){if(!r.success)return;var bar=document.getElementById("mig-bar-"+id);var det=document.getElementById("mig-detail-"+id);if(bar){bar.style.width=r.percent+"%";bar.textContent=r.percent+"%";}if(det){det.textContent=r.migrated_objects+"/"+r.total_objects+" objects \u00b7 "+migFormatBytes(r.migrated_bytes)+" of "+migFormatBytes(r.total_bytes);}if(r.status!=="running"&&r.status!=="scanning"){location.reload();}});},8000);})(' . (int)$am->id . ');';
+            }
+        }
+    }
+    $o .= '});';
+
     $o .= '</script>';
 
     // CSS
@@ -1721,7 +1919,7 @@ DLCRED;
     $o .= '</style>';
     // Fix 5: Clear flash messages when switching tabs
     $o .= '<script>document.addEventListener("DOMContentLoaded",function(){document.querySelectorAll(".nav-tabs a[data-toggle=tab]").forEach(function(a){a.addEventListener("click",function(){document.querySelectorAll(".impulsedrive-dashboard > .alert").forEach(function(el){el.style.display="none";});});});';
-    $o .= 'document.querySelectorAll("a").forEach(function(a){var t=a.textContent.trim();if(t=="Create Bucket"||t=="Delete Bucket"||t=="Create Access Key"||t=="Delete Access Key"||t=="Toggle Versioning"||t=="Reset Password"||t=="List Objects"||t=="Download Object"||t=="Delete Object"||t=="Create Folder"||t=="Get Upload URL"||t=="List Replication Jobs"||t=="Create Replication Job"||t=="Pause Replication Job"||t=="Resume Replication Job"||t=="Delete Replication Job"||t=="Get Replication Job"||t=="Update Replication Job"||t=="Replication Status"){a.style.display="none";}});});</script>';
+    $o .= 'document.querySelectorAll("a").forEach(function(a){var t=a.textContent.trim();if(t=="Create Bucket"||t=="Delete Bucket"||t=="Create Access Key"||t=="Delete Access Key"||t=="Toggle Versioning"||t=="Reset Password"||t=="List Objects"||t=="Download Object"||t=="Delete Object"||t=="Create Folder"||t=="Get Upload URL"||t=="List Replication Jobs"||t=="Create Replication Job"||t=="Pause Replication Job"||t=="Resume Replication Job"||t=="Delete Replication Job"||t=="Get Replication Job"||t=="Update Replication Job"||t=="Replication Status"||t=="Add Custom Domain"||t=="Remove Custom Domain"||t=="Poll Custom Domain"||t=="Validate Migration Source"||t=="Scan Migration Bucket"||t=="Start Migration"||t=="Migration Progress"||t=="Cancel Migration"||t=="Dismiss Migration"){a.style.display="none";}});});</script>';
 
     return $o;
 }
@@ -1759,6 +1957,15 @@ function impulseminio_ClientAreaCustomButtonArray(): array
         'Get Replication Job' => 'clientGetReplicationJob',
         'Update Replication Job' => 'clientUpdateReplicationJob',
         'Replication Status' => 'clientReplicationStatus',
+        'Add Custom Domain' => 'clientAddCustomDomain',
+        'Remove Custom Domain' => 'clientRemoveCustomDomain',
+        'Poll Custom Domain' => 'clientPollCustomDomain',
+        'Validate Migration Source' => 'clientValidateMigrationSource',
+        'Scan Migration Bucket' => 'clientScanMigrationBucket',
+        'Start Migration' => 'clientStartMigration',
+        'Migration Progress' => 'clientMigrationProgress',
+        'Cancel Migration' => 'clientCancelMigration',
+        'Dismiss Migration' => 'clientDismissMigration',
     ];
 }
 
@@ -2750,6 +2957,252 @@ function impulseminio_clientReplicationStatus(array $params): string
         }
 
         return impulseminio_jsonResponse(['success' => true, 'stats' => $statusData]);
+    } catch (\Exception $e) {
+        return impulseminio_jsonResponse(['success' => false, 'error' => $e->getMessage()]);
+    }
+}
+
+/**
+ * Client AJAX: add a custom domain to a public bucket.
+ */
+function impulseminio_clientAddCustomDomain(array $params): string
+{
+    try {
+        if (!impulseminio_hasCustomDomains()) {
+            return impulseminio_jsonResponse(['success' => false, 'error' => 'Custom domains not available. Upgrade to Everything tier.']);
+        }
+        $serviceId = (int)$params['serviceid'];
+        $bucketName = isset($_POST['bucket_name']) ? trim($_POST['bucket_name']) : '';
+        $domain = isset($_POST['domain']) ? strtolower(trim($_POST['domain'])) : '';
+
+        if (empty($bucketName) || empty($domain)) {
+            return impulseminio_jsonResponse(['success' => false, 'error' => 'Bucket and domain are required.']);
+        }
+
+        require_once __DIR__ . '/lib/PublicAccess.php';
+
+        // Get the region origin for multi-region routing
+        $originServer = \WHMCS\Module\Server\ImpulseMinio\PublicAccess::getRegionOrigin($serviceId);
+
+        $result = \WHMCS\Module\Server\ImpulseMinio\PublicAccess::addCustomDomain(
+            $serviceId,
+            $bucketName,
+            $domain,
+            $originServer
+        );
+
+        return impulseminio_jsonResponse($result);
+    } catch (\Exception $e) {
+        return impulseminio_jsonResponse(['success' => false, 'error' => $e->getMessage()]);
+    }
+}
+
+/**
+ * Client AJAX: remove a custom domain from a bucket.
+ */
+function impulseminio_clientRemoveCustomDomain(array $params): string
+{
+    try {
+        if (!impulseminio_hasCustomDomains()) {
+            return impulseminio_jsonResponse(['success' => false, 'error' => 'Custom domains not available.']);
+        }
+        $serviceId = (int)$params['serviceid'];
+        $bucketName = isset($_POST['bucket_name']) ? trim($_POST['bucket_name']) : '';
+
+        if (empty($bucketName)) {
+            return impulseminio_jsonResponse(['success' => false, 'error' => 'Bucket name required.']);
+        }
+
+        require_once __DIR__ . '/lib/PublicAccess.php';
+        $result = \WHMCS\Module\Server\ImpulseMinio\PublicAccess::removeCustomDomain($serviceId, $bucketName);
+        return impulseminio_jsonResponse($result);
+    } catch (\Exception $e) {
+        return impulseminio_jsonResponse(['success' => false, 'error' => $e->getMessage()]);
+    }
+}
+
+/**
+ * Client AJAX: poll custom domain status from Cloudflare.
+ */
+function impulseminio_clientPollCustomDomain(array $params): string
+{
+    try {
+        if (!impulseminio_hasCustomDomains()) {
+            return impulseminio_jsonResponse(['success' => false, 'error' => 'Custom domains not available.']);
+        }
+        $serviceId = (int)$params['serviceid'];
+        $bucketName = isset($_POST['bucket_name']) ? trim($_POST['bucket_name']) : '';
+
+        if (empty($bucketName)) {
+            return impulseminio_jsonResponse(['success' => false, 'error' => 'Bucket name required.']);
+        }
+
+        require_once __DIR__ . '/lib/PublicAccess.php';
+        $result = \WHMCS\Module\Server\ImpulseMinio\PublicAccess::pollCustomDomainStatus($serviceId, $bucketName);
+        return impulseminio_jsonResponse($result);
+    } catch (\Exception $e) {
+        return impulseminio_jsonResponse(['success' => false, 'error' => $e->getMessage()]);
+    }
+}
+
+// =============================================================================
+// MIGRATION AJAX HANDLERS
+// =============================================================================
+/**
+ * Client AJAX: validate migration source credentials and list buckets.
+ */
+function impulseminio_clientValidateMigrationSource(array $params): string
+{
+    try {
+        if (!impulseminio_hasMigration()) {
+            return impulseminio_jsonResponse(['success' => false, 'error' => 'Migration feature not available.']);
+        }
+        $serviceId = (int)$params['serviceid'];
+        $provider = $_POST['provider'] ?? '';
+        $region = $_POST['region'] ?? '';
+        $customEndpoint = $_POST['custom_endpoint'] ?? '';
+        $accessKey = $_POST['access_key'] ?? '';
+        $secretKey = $_POST['secret_key'] ?? '';
+        if (empty($accessKey) || empty($secretKey)) {
+            return impulseminio_jsonResponse(['success' => false, 'error' => 'Access key and secret key are required.']);
+        }
+        require_once __DIR__ . '/lib/Migration.php';
+        $endpoint = \WHMCS\Module\Server\ImpulseMinio\Migration::resolveEndpoint($provider, $region, $customEndpoint);
+        if (empty($endpoint)) {
+            return impulseminio_jsonResponse(['success' => false, 'error' => 'Could not resolve endpoint for this provider.']);
+        }
+        $client = impulseminio_getServiceClient($params);
+        $result = \WHMCS\Module\Server\ImpulseMinio\Migration::validateSource($client, $endpoint, $accessKey, $secretKey);
+        return impulseminio_jsonResponse($result);
+    } catch (\Exception $e) {
+        logModuleCall('impulseminio', __FUNCTION__, $params, $e->getMessage(), $e->getTraceAsString());
+        return impulseminio_jsonResponse(['success' => false, 'error' => $e->getMessage()]);
+    }
+}
+/**
+ * Client AJAX: scan a source bucket for size and object count.
+ */
+function impulseminio_clientScanMigrationBucket(array $params): string
+{
+    try {
+        if (!impulseminio_hasMigration()) {
+            return impulseminio_jsonResponse(['success' => false, 'error' => 'Migration feature not available.']);
+        }
+        $provider = $_POST['provider'] ?? '';
+        $region = $_POST['region'] ?? '';
+        $customEndpoint = $_POST['custom_endpoint'] ?? '';
+        $accessKey = $_POST['access_key'] ?? '';
+        $secretKey = $_POST['secret_key'] ?? '';
+        $sourceBucket = $_POST['source_bucket'] ?? '';
+        if (empty($sourceBucket)) {
+            return impulseminio_jsonResponse(['success' => false, 'error' => 'Source bucket is required.']);
+        }
+        require_once __DIR__ . '/lib/Migration.php';
+        $endpoint = \WHMCS\Module\Server\ImpulseMinio\Migration::resolveEndpoint($provider, $region, $customEndpoint);
+        $result = \WHMCS\Module\Server\ImpulseMinio\Migration::scanSourceBucket($endpoint, $accessKey, $secretKey, $sourceBucket);
+        if ($result['success']) {
+            $result['total_bytes_display'] = \WHMCS\Module\Server\ImpulseMinio\Migration::formatBytes((int)($result['total_bytes'] ?? 0));
+        }
+        return impulseminio_jsonResponse($result);
+    } catch (\Exception $e) {
+        logModuleCall('impulseminio', __FUNCTION__, $params, $e->getMessage(), $e->getTraceAsString());
+        return impulseminio_jsonResponse(['success' => false, 'error' => $e->getMessage()]);
+    }
+}
+/**
+ * Client AJAX: start a migration job.
+ */
+function impulseminio_clientStartMigration(array $params): string
+{
+    try {
+        if (!impulseminio_hasMigration()) {
+            return impulseminio_jsonResponse(['success' => false, 'error' => 'Migration feature not available.']);
+        }
+        $serviceId = (int)$params['serviceid'];
+        $provider = $_POST['provider'] ?? '';
+        $region = $_POST['region'] ?? '';
+        $customEndpoint = $_POST['custom_endpoint'] ?? '';
+        $accessKey = $_POST['access_key'] ?? '';
+        $secretKey = $_POST['secret_key'] ?? '';
+        $sourceBucket = $_POST['source_bucket'] ?? '';
+        $destBucket = $_POST['dest_bucket'] ?? '';
+        $totalObjects = (int)($_POST['total_objects'] ?? 0);
+        $totalBytes = (int)($_POST['total_bytes'] ?? 0);
+        if (empty($sourceBucket) || empty($destBucket)) {
+            return impulseminio_jsonResponse(['success' => false, 'error' => 'Source and destination buckets are required.']);
+        }
+        if (empty($accessKey) || empty($secretKey)) {
+            return impulseminio_jsonResponse(['success' => false, 'error' => 'Source credentials are required.']);
+        }
+        require_once __DIR__ . '/lib/Migration.php';
+        $endpoint = \WHMCS\Module\Server\ImpulseMinio\Migration::resolveEndpoint($provider, $region, $customEndpoint);
+        $result = \WHMCS\Module\Server\ImpulseMinio\Migration::startMigration(
+            $serviceId, $provider, $endpoint, $region,
+            $accessKey, $secretKey,
+            $sourceBucket, $destBucket,
+            $totalObjects, $totalBytes
+        );
+        return impulseminio_jsonResponse($result);
+    } catch (\Exception $e) {
+        logModuleCall('impulseminio', __FUNCTION__, $params, $e->getMessage(), $e->getTraceAsString());
+        return impulseminio_jsonResponse(['success' => false, 'error' => $e->getMessage()]);
+    }
+}
+/**
+ * Client AJAX: get migration progress.
+ */
+function impulseminio_clientMigrationProgress(array $params): string
+{
+    try {
+        if (!impulseminio_hasMigration()) {
+            return impulseminio_jsonResponse(['success' => false, 'error' => 'Migration feature not available.']);
+        }
+        $jobId = (int)($_POST['job_id'] ?? 0);
+        if (!$jobId) {
+            return impulseminio_jsonResponse(['success' => false, 'error' => 'Job ID required.']);
+        }
+        require_once __DIR__ . '/lib/Migration.php';
+        $result = \WHMCS\Module\Server\ImpulseMinio\Migration::getProgress($jobId);
+        return impulseminio_jsonResponse($result);
+    } catch (\Exception $e) {
+        return impulseminio_jsonResponse(['success' => false, 'error' => $e->getMessage()]);
+    }
+}
+/**
+ * Client AJAX: cancel a running migration.
+ */
+function impulseminio_clientCancelMigration(array $params): string
+{
+    try {
+        if (!impulseminio_hasMigration()) {
+            return impulseminio_jsonResponse(['success' => false, 'error' => 'Migration feature not available.']);
+        }
+        $serviceId = (int)$params['serviceid'];
+        $jobId = (int)($_POST['job_id'] ?? 0);
+        if (!$jobId) {
+            return impulseminio_jsonResponse(['success' => false, 'error' => 'Job ID required.']);
+        }
+        require_once __DIR__ . '/lib/Migration.php';
+        $result = \WHMCS\Module\Server\ImpulseMinio\Migration::cancelMigration($jobId, $serviceId);
+        return impulseminio_jsonResponse($result);
+    } catch (\Exception $e) {
+        return impulseminio_jsonResponse(['success' => false, 'error' => $e->getMessage()]);
+    }
+}
+/**
+ * Client AJAX: dismiss a completed migration card.
+ */
+function impulseminio_clientDismissMigration(array $params): string
+{
+    try {
+        $serviceId = (int)$params['serviceid'];
+        $jobId = (int)($_POST['job_id'] ?? 0);
+        if (!$jobId) {
+            return impulseminio_jsonResponse(['success' => false, 'error' => 'Job ID required.']);
+        }
+        require_once __DIR__ . '/lib/Migration.php';
+        $result = \WHMCS\Module\Server\ImpulseMinio\Migration::dismissMigration($jobId, $serviceId);
+        return impulseminio_jsonResponse($result);
     } catch (\Exception $e) {
         return impulseminio_jsonResponse(['success' => false, 'error' => $e->getMessage()]);
     }
