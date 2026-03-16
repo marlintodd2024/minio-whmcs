@@ -62,6 +62,8 @@ function impulseminio_addon_activate(): array
         $defaults = [
             'premium_license_key' => '',
             'cf_zone_id' => '', 'cf_api_token' => '', 'cf_fallback_origin' => '',
+            'cf_account_id' => '',
+            'domain_map_secret' => '',
             'custom_domain_limit' => '3', 'replication_job_limit' => '5',
             'suspension_grace_days' => '7', 'suspension_warning_day' => '5',
             'bw_stats_secret' => '', 'bw_stats_path_prefix' => '/___impulse_bw_stats_',
@@ -90,14 +92,14 @@ function impulseminio_getSetting(string $key, ?string $default = null): ?string
     try {
         $row = Capsule::table('mod_impulseminio_settings')->where('setting_key', $key)->first();
         if (!$row) return $default;
-        if (in_array($key, ['cf_api_token']) && !empty($row->setting_value)) return decrypt($row->setting_value);
+        if (in_array($key, ['cf_api_token', 'domain_map_secret']) && !empty($row->setting_value)) return decrypt($row->setting_value);
         return $row->setting_value;
     } catch (\Exception $e) { return $default; }
 }
 
 function impulseminio_setSetting(string $key, string $value): void
 {
-    $store = (in_array($key, ['cf_api_token']) && !empty($value)) ? encrypt($value) : $value;
+    $store = (in_array($key, ['cf_api_token', 'domain_map_secret']) && !empty($value)) ? encrypt($value) : $value;
     Capsule::table('mod_impulseminio_settings')->updateOrInsert(
         ['setting_key' => $key],
         ['setting_value' => $store, 'updated_at' => date('Y-m-d H:i:s')]
@@ -113,11 +115,13 @@ function impulseminio_addon_output(array $vars): void
     if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         $action = $_POST['action'] ?? '';
         if ($action === 'save_settings') {
-            $fields = ['premium_license_key','cf_zone_id','cf_fallback_origin','custom_domain_limit','replication_job_limit',
+            $fields = ['premium_license_key','cf_zone_id','cf_fallback_origin','cf_account_id','custom_domain_limit','replication_job_limit',
                         'suspension_grace_days','suspension_warning_day','bw_stats_secret','bw_stats_path_prefix'];
             foreach ($fields as $key) { if (isset($_POST[$key])) impulseminio_setSetting($key, trim($_POST[$key])); }
             if (isset($_POST['cf_api_token']) && $_POST['cf_api_token'] !== '********')
                 impulseminio_setSetting('cf_api_token', trim($_POST['cf_api_token']));
+            if (isset($_POST['domain_map_secret']) && $_POST['domain_map_secret'] !== '********')
+                impulseminio_setSetting('domain_map_secret', trim($_POST['domain_map_secret']));
             $message = '<div class="successbox"><strong>Settings saved.</strong></div>';
         }
         if ($action === 'verify_license') {
@@ -171,10 +175,11 @@ function impulseminio_addon_output(array $vars): void
 
     // Load data
     $settings = [];
-    foreach (['premium_license_key','cf_zone_id','cf_api_token','cf_fallback_origin','custom_domain_limit','replication_job_limit',
+    foreach (['premium_license_key','cf_zone_id','cf_api_token','cf_fallback_origin','cf_account_id','domain_map_secret','custom_domain_limit','replication_job_limit',
               'suspension_grace_days','suspension_warning_day','bw_stats_secret','bw_stats_path_prefix'] as $k)
         $settings[$k] = impulseminio_getSetting($k, '');
     $tokenDisplay = !empty($settings['cf_api_token']) ? '********' : '';
+    $secretDisplay = !empty($settings['domain_map_secret']) ? '********' : '';
     $regions = Capsule::table('mod_impulseminio_regions')->orderBy('sort_order')->get()->toArray();
     $servers = Capsule::table('tblservers')->where('type', 'impulseminio')->where('active', 1)->get()->toArray();
     $serviceCount = 0; $replCount = 0;
@@ -245,7 +250,8 @@ function impulseminio_addon_output(array $vars): void
         echo '<div class="im-panel"><div class="im-panel-head">Configuration Status</div><div class="im-panel-body">';
         $checks = [['Premium License Key',!empty($settings['premium_license_key'])],['Regions configured',count($regions)>0],
                    ['CF Zone ID',!empty($settings['cf_zone_id'])],['CF API Token',!empty($settings['cf_api_token'])],
-                   ['Fallback Origin',!empty($settings['cf_fallback_origin'])],['BW Stats Secret',!empty($settings['bw_stats_secret'])]];
+                   ['Fallback Origin',!empty($settings['cf_fallback_origin'])],['CF Account ID',!empty($settings['cf_account_id'] ?? '')],
+                   ['Domain Map Secret',!empty($settings['domain_map_secret'] ?? '')],['BW Stats Secret',!empty($settings['bw_stats_secret'])]];
         foreach ($checks as [$l,$ok]) { $i=$ok?'<span style="color:#28a745;">&#10004;</span>':'<span style="color:#dc3545;">&#10008;</span>'; echo '<div style="padding:4px 0;">'.$i.' '.$esc($l).'</div>'; }
         echo '</div></div>';
     }
@@ -390,10 +396,19 @@ function impulseminio_addon_output(array $vars): void
         echo '<div class="im-help">Zone ID for your MinIO namespace domain (e.g., impulsedrive.io). Found in Cloudflare Dashboard &rarr; your zone &rarr; Overview (right sidebar).</div></div>';
         echo '<div class="im-fg"><label>Cloudflare API Token</label>';
         echo '<input type="password" name="cf_api_token" value="'.$esc($tokenDisplay).'" placeholder="Enter API token">';
-        echo '<div class="im-help">Create at <a href="https://dash.cloudflare.com/profile/api-tokens" target="_blank">Cloudflare &rarr; My Profile &rarr; API Tokens</a>. Use the "Custom" template with permissions: <strong>Zone &rarr; SSL and Certificates &rarr; Edit</strong> + <strong>Zone &rarr; Zone &rarr; Read</strong>, scoped to your namespace zone.</div></div>';
+        echo '<div class="im-help">Create at <a href="https://dash.cloudflare.com/profile/api-tokens" target="_blank">Cloudflare &rarr; My Profile &rarr; API Tokens</a>. Use the "Custom" template with permissions: <strong>Zone &rarr; SSL and Certificates &rarr; Edit</strong> + <strong>Zone &rarr; DNS &rarr; Read</strong>, scoped to your namespace zone.</div></div>';
         echo '<div class="im-fg"><label>Fallback Origin</label>';
         echo '<input type="text" name="cf_fallback_origin" value="'.$esc($settings['cf_fallback_origin']).'" placeholder="cdn-fallback.yourdomain.com">';
         echo '<div class="im-help">A proxied (orange-clouded) A/AAAA record in Cloudflare pointing to your primary MinIO server. This is the default origin for custom hostname traffic. Must be created in Cloudflare DNS before setting here.</div></div>';
+        echo '<div class="im-fg"><label>Account ID</label>';
+        echo '<input type="text" name="cf_account_id" value="'.$esc($settings['cf_account_id'] ?? '').'" placeholder="e.g., 1a2b3c4d5e6f7g8h9i0j">';
+        echo '<div class="im-help">Found in Cloudflare Dashboard &rarr; any zone &rarr; Overview (right sidebar, below Zone ID).</div></div>';
+        echo '</div></div>';
+        echo '<div class="im-panel"><div class="im-panel-head">Domain Map Service</div><div class="im-panel-body">';
+        echo '<div class="im-info"><strong>Domain Map Updater:</strong> A lightweight Python service runs on each MinIO server (port 9099). When a customer adds or removes a custom domain, WHMCS calls this service to update the Nginx routing map. The shared secret authenticates requests between WHMCS and the MinIO servers.</div>';
+        echo '<div class="im-fg"><label>Domain Map Secret</label>';
+        echo '<input type="password" name="domain_map_secret" value="'.$esc($secretDisplay).'" placeholder="Enter shared secret from /etc/impulsedrive/domain-map.secret">';
+        echo '<div class="im-help">The shared secret generated on your MinIO servers at <code>/etc/impulsedrive/domain-map.secret</code>. Must match across all regions and this WHMCS instance.</div></div>';
         echo '</div></div>';
         echo '<button type="submit" class="im-btn im-btn-p"><i class="fas fa-save"></i> Save Cloudflare Settings</button></form>';
     }
