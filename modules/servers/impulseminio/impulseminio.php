@@ -1005,9 +1005,14 @@ function impulseminio_renderClientArea(array $params = []): string
             ->leftJoin('mod_impulseminio_regions as dr', 'j.dest_region_id', '=', 'dr.id')
             ->where('j.service_id', $serviceId)
             ->whereNotIn('j.status', ['removing', 'deleted'])
-            ->select('j.*', 'sr.name as src_region_name', 'sr.cdn_endpoint as src_cdn',
-                'dr.name as dest_region_name', 'dr.cdn_endpoint as dest_cdn',
-                'dr.server_id as dest_server_id')
+            ->select(
+                'j.*',
+                'sr.name as src_region_name',
+                'sr.cdn_endpoint as src_cdn',
+                'dr.name as dest_region_name',
+                'dr.cdn_endpoint as dest_cdn',
+                'dr.server_id as dest_server_id'
+            )
             ->get()->toArray();
         foreach ($replJobs as $rj) {
             $replicaBuckets[] = (object)[
@@ -3137,10 +3142,16 @@ function impulseminio_clientStartMigration(array $params): string
         require_once __DIR__ . '/lib/Migration.php';
         $endpoint = \WHMCS\Module\Server\ImpulseMinio\Migration::resolveEndpoint($provider, $region, $customEndpoint);
         $result = \WHMCS\Module\Server\ImpulseMinio\Migration::startMigration(
-            $serviceId, $provider, $endpoint, $region,
-            $accessKey, $secretKey,
-            $sourceBucket, $destBucket,
-            $totalObjects, $totalBytes
+            $serviceId,
+            $provider,
+            $endpoint,
+            $region,
+            $accessKey,
+            $secretKey,
+            $sourceBucket,
+            $destBucket,
+            $totalObjects,
+            $totalBytes
         );
         return impulseminio_jsonResponse($result);
     } catch (\Exception $e) {
