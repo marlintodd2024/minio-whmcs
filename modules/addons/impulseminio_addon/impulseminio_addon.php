@@ -290,7 +290,8 @@ function impulseminio_addon_output(array $vars): void
         if (!empty($licenseKey)) {
             $statusColors = ['active'=>'#28a745','invalid'=>'#dc3545','error'=>'#dc3545','missing'=>'#ffc107'];
             $statusLabels = ['active'=>'Active','invalid'=>'Invalid','error'=>'Error','missing'=>'Files Missing'];
-            $sc = $statusColors[$licenseStatus] ?? '#999'; $sl = $statusLabels[$licenseStatus] ?? 'Unknown';
+            $sc = array_key_exists($licenseStatus, $statusColors) ? $statusColors[$licenseStatus] : '#999';
+            $sl = array_key_exists($licenseStatus, $statusLabels) ? $statusLabels[$licenseStatus] : 'Unknown';
             echo '<div style="background:#f8f9fa;border:1px solid #e9ecef;border-radius:6px;padding:16px;margin-bottom:16px;">';
             echo '<div style="display:flex;align-items:center;gap:12px;margin-bottom:8px;flex-wrap:wrap;">';
             echo '<span style="display:inline-block;width:12px;height:12px;border-radius:50%;background:'.$sc.';"></span>';
